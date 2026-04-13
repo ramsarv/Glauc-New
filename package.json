@@ -1,0 +1,24 @@
+{
+  "name": "glauc-gateway",
+  "version": "1.0.0",
+  "description": "Glauc Node.js API Gateway — auth, rate limiting, image preprocessing",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start":   "node server.js",
+    "dev":     "node --watch server.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.4.3",
+    "dotenv":         "^16.4.5",
+    "express":        "^5.0.1",
+    "form-data":      "^4.0.0",
+    "jose":           "^5.2.3",
+    "multer":         "^1.4.5-lts.1",
+    "node-fetch":     "^3.3.2",
+    "sharp":          "^0.33.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

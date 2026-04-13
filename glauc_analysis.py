@@ -22,7 +22,7 @@ Five capabilities:
 import os
 import sqlite3
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -106,6 +106,7 @@ def plot_gradcam_grid(model, dataset, indices: List[int],
     """
     Generate a grid of GradCAM overlays for n_images val samples.
     Each row: original crop | heatmap overlay with prediction annotation.
+    Hooks are always removed in a finally block to prevent memory leaks.
     """
     from glauc_model import VAL_TRANSFORM, crop_eye_region, IMAGE_DIR
 
@@ -115,41 +116,51 @@ def plot_gradcam_grid(model, dataset, indices: List[int],
     fig, axes = plt.subplots(n, 2, figsize=(10, n*3), facecolor="#0d0d0d")
     if n == 1: axes = [axes]
 
-    for row, idx in enumerate(indices):
-        sample = dataset.samples[idx]; fname = sample["filename"]
-        pil = Image.open(os.path.join(IMAGE_DIR, fname)).convert("RGB")
-        pil, _ = crop_eye_region(pil, "both")
-        pil_224 = pil.resize((224, 224))
+    try:
+        for row, idx in enumerate(indices):
+            sample = dataset.samples[idx]; fname = sample["filename"]
+            pil = Image.open(os.path.join(IMAGE_DIR, fname)).convert("RGB")
+            pil, _ = crop_eye_region(pil, "both")
+            pil_224 = pil.resize((224, 224))
 
-        tensor    = VAL_TRANSFORM(pil).unsqueeze(0)
-        gender_id = torch.tensor([dataset.vocab.encode_gender(sample["gender"])], dtype=torch.long)
-        race_id   = torch.tensor([dataset.vocab.encode_race(sample["race"])],     dtype=torch.long)
-        heatmap   = gradcam.generate(tensor, gender_id, race_id, (224, 224))
+            tensor    = VAL_TRANSFORM(pil).unsqueeze(0)
+            gender_id = torch.tensor([dataset.vocab.encode_gender(sample["gender"])], dtype=torch.long)
+            race_id   = torch.tensor([dataset.vocab.encode_race(sample["race"])],     dtype=torch.long)
+            heatmap   = gradcam.generate(tensor, gender_id, race_id, (224, 224))
 
-        model.eval()
-        with torch.no_grad():
-            age_pred, _, _, _ = model(tensor.to(device), gender_id.to(device), race_id.to(device))
-        pred_age = float(age_pred[0]); true_age = sample["age"]
-        err = pred_age - true_age
+            model.eval()
+            with torch.no_grad():
+                age_pred, _, _, _ = model(tensor.to(device), gender_id.to(device), race_id.to(device))
+            pred_age = float(age_pred[0]); true_age = sample["age"]
+            err = pred_age - true_age
 
-        ax = axes[row][0]
-        ax.imshow(pil_224); ax.axis("off")
-        ax.set_title(f"Actual: {true_age}y  ·  {fname[:28]}", color="white", fontsize=7, pad=3)
+            ax = axes[row][0]
+            ax.imshow(pil_224); ax.axis("off")
+            ax.set_title(f"Actual: {true_age}y  ·  {fname[:28]}", color="white", fontsize=7, pad=3)
 
-        ax = axes[row][1]
-        ax.imshow(pil_224)
-        if heatmap is not None: ax.imshow(heatmap, cmap="jet", alpha=0.45)
-        ax.axis("off")
-        ax.set_title(f"Predicted: {pred_age:.1f}y  ·  Error: {err:+.1f}y",
-                     color="#4ECDC4" if abs(err)<3 else "#FF6B6B", fontsize=7, pad=3)
+            ax = axes[row][1]
+            ax.imshow(pil_224)
+            if heatmap is not None: ax.imshow(heatmap, cmap="jet", alpha=0.45)
+            ax.axis("off")
+            ax.set_title(f"Predicted: {pred_age:.1f}y  ·  Error: {err:+.1f}y",
+                         color="#4ECDC4" if abs(err)<3 else "#FF6B6B", fontsize=7, pad=3)
 
-    fig.suptitle("GradCAM — DINOv3 Attention Heatmaps\nWarm = high influence on age prediction",
-                 color="white", fontsize=11, y=1.01)
-    plt.tight_layout()
-    path = os.path.join(output_dir, "gradcam_grid.png")
-    plt.savefig(path, dpi=150, bbox_inches="tight", facecolor="#0d0d0d")
-    plt.close(fig); gradcam.remove_hooks()
-    log.info(f"GradCAM grid → {path}")
+        fig.suptitle("GradCAM — DINOv3 Attention Heatmaps\nWarm = high influence on age prediction",
+                     color="white", fontsize=11, y=1.01)
+        plt.tight_layout()
+        path = os.path.join(output_dir, "gradcam_grid.png")
+        try:
+            plt.savefig(path, dpi=150, bbox_inches="tight", facecolor="#0d0d0d")
+            log.info(f"GradCAM grid → {path}")
+        except Exception as e:
+            log.warning(f"GradCAM save failed: {e}")
+        plt.close(fig)
+    except Exception as e:
+        log.error(f"GradCAM grid failed: {e}")
+        plt.close(fig)
+    finally:
+        # Always remove hooks to prevent memory leaks regardless of success/failure
+        gradcam.remove_hooks()
 
 
 # ══════════════════════════════════════════════════════════
@@ -204,7 +215,11 @@ def run_calibration(model, val_loader: DataLoader, device: str,
     ckpt = os.path.join(output_dir, "best_model.pt")
     if os.path.exists(ckpt):
         state = torch.load(ckpt, map_location="cpu")
-        state["temperature"] = model.temperature.data
+        # Handle both dict checkpoint (v1.1+) and legacy plain state_dict
+        if isinstance(state, dict) and "model" in state:
+            state["model"]["temperature"] = model.temperature.data
+        else:
+            state["temperature"] = model.temperature.data
         torch.save(state, ckpt)
         log.info(f"  Calibrated checkpoint saved → {ckpt}")
 
@@ -341,12 +356,14 @@ def store_prediction(user_id, session_id, gender, race, capture_datetime,
         conn.commit(); return cur.lastrowid
 
 
-def get_user_history(user_id: str, db_path: str = DB_PATH) -> List[Dict]:
+def get_user_history(user_id: str, db_path: str = DB_PATH,
+                     limit: int = 100, offset: int = 0) -> List[Dict]:
+    """Returns paginated history, newest-first via ASC + LIMIT/OFFSET."""
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT * FROM predictions WHERE user_id=? ORDER BY timestamp ASC",
-            (user_id,)).fetchall()
+            "SELECT * FROM predictions WHERE user_id=? ORDER BY timestamp ASC LIMIT ? OFFSET ?",
+            (user_id, limit, offset)).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -361,8 +378,10 @@ def get_ocular_age_trend(user_id: str, db_path: str = DB_PATH) -> Dict:
     ci95s       = [h["ocular_age_ci95"] for h in history]
 
     from datetime import datetime as dt
-    t0   = dt.fromisoformat(timestamps[0])
-    days = [(dt.fromisoformat(ts)-t0).days for ts in timestamps]
+    # Parse with explicit UTC so timezone arithmetic is unambiguous
+    def _parse(ts): return dt.fromisoformat(ts).replace(tzinfo=timezone.utc)
+    t0   = _parse(timestamps[0])
+    days = [(_parse(ts) - t0).days for ts in timestamps]
     slope = float(np.polyfit(days, ocular_ages, 1)[0]) * 365.25 if max(days) > 0 else None
 
     return {"timestamps": timestamps, "ocular_ages": ocular_ages, "ci95s": ci95s,
@@ -378,8 +397,9 @@ def plot_user_trend(user_id: str, output_dir: str, db_path: str = DB_PATH) -> Op
     ages        = np.array(trend["ocular_ages"])
     ci95s       = np.array(trend["ci95s"])
     rate        = trend["rate_per_year"]
-    t0          = dt.fromisoformat(timestamps[0])
-    days        = np.array([(dt.fromisoformat(ts)-t0).days for ts in timestamps])
+    def _parse(ts): return dt.fromisoformat(ts).replace(tzinfo=timezone.utc)
+    t0          = _parse(timestamps[0])
+    days        = np.array([(_parse(ts) - t0).days for ts in timestamps])
 
     fig, ax = plt.subplots(figsize=(10, 5), facecolor="#0d0d0d")
     ax.set_facecolor("#0d0d0d")

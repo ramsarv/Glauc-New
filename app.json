@@ -1,0 +1,77 @@
+{
+  "expo": {
+    "name": "Glauc",
+    "slug": "glauc",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "scheme": "glauc",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0A0A0F"
+    },
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.glauc.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Glauc needs camera access to capture your eye image for ocular age analysis.",
+        "NSPhotoLibraryUsageDescription": "Glauc needs photo library access to select eye images for analysis.",
+        "NSUserNotificationsUsageDescription": "Glauc sends reminders when it's time for your next eye scan."
+      },
+      "config": {
+        "googleSignIn": {
+          "reservedClientId": "$(GOOGLE_IOS_REVERSED_CLIENT_ID)"
+        }
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0A0A0F"
+      },
+      "package": "com.glauc.app",
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.RECEIVE_BOOT_COMPLETED",
+        "android.permission.VIBRATE"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png",
+      "bundler": "metro"
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Glauc needs camera access to capture your eye image for ocular age analysis."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Glauc needs photo library access to select eye images for analysis."
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/notification-icon.png",
+          "color": "#C8922A",
+          "sounds": []
+        }
+      ],
+      "expo-secure-store",
+      "expo-font"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "your-eas-project-id"
+      }
+    }
+  }
+}

@@ -1,20 +1,13 @@
 /**
- * glauc-gateway/server.js  v1.1
+ * glauc-gateway/server.js  v1.2
  * ══════════════════════════════════════════════════════════════
  * Production-hardened Node.js API Gateway.
  *
- * Security fixes (v1.1):
- *   • JWT_SECRET required — process exits if unset (no fallback)
- *   • GATEWAY_SECRET — HMAC shared secret to Python API
- *   • bcryptjs — argon2-comparable password hashing (cost 12)
- *   • express-rate-limit — 10 attempts / 15 min on auth routes
- *   • helmet — secure HTTP headers
- *   • CORS — whitelist via CORS_ORIGINS env var; wildcard only in dev
- *   • JSON body size capped at 1 MB
- *   • Email format validated before DB write
- *   • Demographic inputs whitelisted / length-capped before Python API
- *   • Structured JSON logging throughout
- *   • HTTPS warning on production startup without proxy
+ * v1.2 additions:
+ *   • POST /auth/google — verifies Google ID token via tokeninfo endpoint
+ *   • POST /auth/apple  — verifies Apple identity token via JWKS (jose)
+ *   • oauth_accounts table for provider ↔ user mapping
+ *   • GOOGLE_CLIENT_ID / APPLE_BUNDLE_ID audience checks
  */
 
 import "dotenv/config";
@@ -22,7 +15,7 @@ import express        from "express";
 import multer         from "multer";
 import sharp          from "sharp";
 import Database       from "better-sqlite3";
-import { SignJWT, jwtVerify } from "jose";
+import { SignJWT, jwtVerify, importJWK } from "jose";
 import fetch          from "node-fetch";
 import FormData       from "form-data";
 import { randomUUID, createHmac } from "crypto";
@@ -41,7 +34,7 @@ const MAX_SCANS_DAY  = parseInt(process.env.MAX_SCANS_DAY || "10");
 const MAX_FILE_MB    = 15;
 const NODE_ENV       = process.env.NODE_ENV || "development";
 
-// Fail hard if JWT_SECRET not set — never run without it
+// Fail hard if JWT_SECRET not set
 if (!process.env.JWT_SECRET) {
   console.error(JSON.stringify({ level: "fatal", msg: "JWT_SECRET env var is required. Exiting." }));
   process.exit(1);
@@ -49,17 +42,24 @@ if (!process.env.JWT_SECRET) {
 const JWT_SECRET_RAW = process.env.JWT_SECRET;
 const JWT_SECRET     = new TextEncoder().encode(JWT_SECRET_RAW);
 
-// Shared secret between gateway and Python API
 const GATEWAY_SECRET = process.env.GATEWAY_SECRET || "";
 if (!GATEWAY_SECRET) {
   console.warn(JSON.stringify({ level: "warn", msg: "GATEWAY_SECRET not set — Python API has no gateway auth." }));
 }
 
-// CORS whitelist (comma-separated origins in env)
+// OAuth config
+const GOOGLE_CLIENT_IDS = [
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_IOS_CLIENT_ID,
+  process.env.GOOGLE_ANDROID_CLIENT_ID,
+].filter(Boolean);
+
+const APPLE_BUNDLE_ID = process.env.APPLE_BUNDLE_ID || "com.glauc.app";
+
+// CORS whitelist
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || "")
   .split(",").map(s => s.trim()).filter(Boolean);
 
-// Validated gender / race token lists (prevent prompt injection)
 const VALID_GENDERS = new Set(["M", "F", "MALE", "FEMALE", "OTHER"]);
 
 
@@ -70,8 +70,6 @@ const log = {
   error: (msg, meta = {}) => console.error(JSON.stringify({ level: "error", ts: new Date().toISOString(), msg, ...meta })),
 };
 
-
-// ── EMAIL VALIDATOR ───────────────────────────────────────────
 const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,253}\.[^\s@]{2,}$/;
 
 
@@ -90,6 +88,15 @@ db.exec(`
     last_scan_at   TEXT
   );
 
+  CREATE TABLE IF NOT EXISTS oauth_accounts (
+    id          TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL,
+    provider    TEXT NOT NULL,
+    provider_id TEXT NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    UNIQUE(provider, provider_id)
+  );
+
   CREATE TABLE IF NOT EXISTS scan_log (
     id         TEXT PRIMARY KEY,
     user_id    TEXT NOT NULL,
@@ -98,14 +105,15 @@ db.exec(`
   );
 `);
 
-// Prepared statements
 const stmts = {
-  findByEmail:    db.prepare("SELECT * FROM users WHERE email = ?"),
-  findById:       db.prepare("SELECT * FROM users WHERE id = ?"),
-  createUser:     db.prepare("INSERT INTO users (id, email, password_hash, name) VALUES (?, ?, ?, ?)"),
-  scansToday:     db.prepare("SELECT COUNT(*) AS n FROM scan_log WHERE user_id = ? AND date(created_at) = date('now','utc')"),
-  logScan:        db.prepare("INSERT INTO scan_log (id, user_id) VALUES (?, ?)"),
-  updateLastScan: db.prepare("UPDATE users SET last_scan_at = datetime('now','utc') WHERE id = ?"),
+  findByEmail:      db.prepare("SELECT * FROM users WHERE email = ?"),
+  findById:         db.prepare("SELECT * FROM users WHERE id = ?"),
+  createUser:       db.prepare("INSERT INTO users (id, email, password_hash, name) VALUES (?, ?, ?, ?)"),
+  findOAuth:        db.prepare("SELECT u.* FROM oauth_accounts o JOIN users u ON u.id = o.user_id WHERE o.provider = ? AND o.provider_id = ?"),
+  linkOAuth:        db.prepare("INSERT OR IGNORE INTO oauth_accounts (id, user_id, provider, provider_id) VALUES (?, ?, ?, ?)"),
+  scansToday:       db.prepare("SELECT COUNT(*) AS n FROM scan_log WHERE user_id = ? AND date(created_at) = date('now','utc')"),
+  logScan:          db.prepare("INSERT INTO scan_log (id, user_id) VALUES (?, ?)"),
+  updateLastScan:   db.prepare("UPDATE users SET last_scan_at = datetime('now','utc') WHERE id = ?"),
 };
 
 
@@ -122,24 +130,18 @@ const upload = multer({
   },
 });
 
-// Secure HTTP headers
 app.use(helmet());
-
-// Body size limits
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 
-// CORS — wildcard only in development; production requires CORS_ORIGINS
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   let allowed = null;
-
   if (CORS_ORIGINS.length > 0) {
     if (CORS_ORIGINS.includes(origin)) allowed = origin;
   } else if (NODE_ENV !== "production") {
     allowed = "*";
   }
-
   if (allowed) {
     res.header("Access-Control-Allow-Origin", allowed);
     if (allowed !== "*") res.header("Vary", "Origin");
@@ -150,7 +152,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Structured request logger
 app.use((req, res, next) => {
   const start = Date.now();
   res.on("finish", () => log.info("request", {
@@ -160,7 +161,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Auth rate limiter — 10 attempts per 15 minutes per IP
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -172,14 +172,9 @@ const authLimiter = rateLimit({
 
 
 // ── AUTH HELPERS ──────────────────────────────────────────────
-async function hashPassword(pw) {
-  return bcryptjs.hash(pw, 12);
-}
-async function verifyPassword(pw, hash) {
-  return bcryptjs.compare(pw, hash);
-}
+async function hashPassword(pw) { return bcryptjs.hash(pw, 12); }
+async function verifyPassword(pw, hash) { return bcryptjs.compare(pw, hash); }
 
-// HMAC-based anonymisation (keyed, not plain SHA256)
 function anonymiseId(id) {
   return createHmac("sha256", JWT_SECRET_RAW).update(id).digest("hex").slice(0, 32);
 }
@@ -206,13 +201,10 @@ async function verifyToken(req, res, next) {
   }
 }
 
-// Forward gateway secret to Python API
 function gatewayHeaders() {
   return GATEWAY_SECRET ? { "X-Gateway-Secret": GATEWAY_SECRET } : {};
 }
 
-
-// ── SCAN RATE LIMITER ─────────────────────────────────────────
 function checkScanRateLimit(req, res, next) {
   const { n } = stmts.scansToday.get(req.userId);
   if (n >= MAX_SCANS_DAY) {
@@ -226,19 +218,26 @@ function checkScanRateLimit(req, res, next) {
   next();
 }
 
+// Build a safe user response object
+function userResponse(user) {
+  return {
+    id:    anonymiseId(user.id),
+    email: user.email,
+    name:  user.name || "",
+  };
+}
+
 
 // ── ROUTES ────────────────────────────────────────────────────
-
 app.get("/health", (_req, res) => res.json({
-  status: "ok", gateway: "glauc-node-gateway", version: "1.1.0",
+  status: "ok", gateway: "glauc-node-gateway", version: "1.2.0",
   timestamp: new Date().toISOString(),
 }));
 
 
-// ── AUTH: POST /auth/register ─────────────────────────────────
+// ── POST /auth/register ───────────────────────────────────────
 app.post("/auth/register", authLimiter, async (req, res) => {
   const { email = "", password = "", name = "" } = req.body;
-
   if (!email || !password) {
     return res.status(400).json({ error: "Email and password are required." });
   }
@@ -248,23 +247,17 @@ app.post("/auth/register", authLimiter, async (req, res) => {
   if (password.length < 8) {
     return res.status(400).json({ error: "Password must be at least 8 characters." });
   }
-
   const normEmail = email.toLowerCase().trim();
   if (stmts.findByEmail.get(normEmail)) {
     return res.status(409).json({ error: "An account with this email already exists." });
   }
-
   const userId       = randomUUID();
   const passwordHash = await hashPassword(password);
-
   try {
     stmts.createUser.run(userId, normEmail, passwordHash, name.trim() || "");
     const token = await signToken(userId);
     log.info("user_registered", { userId: anonymiseId(userId) });
-    return res.status(201).json({
-      token,
-      user: { id: anonymiseId(userId), email: normEmail, name: name.trim() || "" },
-    });
+    return res.status(201).json({ token, isNewUser: true, user: userResponse({ id: userId, email: normEmail, name: name.trim() }) });
   } catch (err) {
     log.error("register_error", { message: err.message });
     return res.status(500).json({ error: "Registration failed." });
@@ -272,17 +265,13 @@ app.post("/auth/register", authLimiter, async (req, res) => {
 });
 
 
-// ── AUTH: POST /auth/login ────────────────────────────────────
+// ── POST /auth/login ──────────────────────────────────────────
 app.post("/auth/login", authLimiter, async (req, res) => {
   const { email = "", password = "" } = req.body;
-
   if (!email || !password) {
     return res.status(400).json({ error: "Email and password are required." });
   }
-
   const user = stmts.findByEmail.get(email.toLowerCase().trim());
-
-  // Use bcrypt constant-time compare; always compare to prevent timing attacks
   const dummyHash = "$2b$12$invalidhashfortimingnormalization00000000000000000000000";
   const valid = user
     ? await verifyPassword(password, user.password_hash)
@@ -292,49 +281,183 @@ app.post("/auth/login", authLimiter, async (req, res) => {
     log.warn("login_failed", { prefix: email.slice(0, 3) });
     return res.status(401).json({ error: "Invalid email or password." });
   }
-
   const token = await signToken(user.id);
   log.info("login_success", { userId: anonymiseId(user.id) });
-  return res.json({
-    token,
-    user: { id: anonymiseId(user.id), email: user.email, name: user.name },
-  });
+  return res.json({ token, isNewUser: false, user: userResponse(user) });
 });
 
 
-// ── AUTH: GET /auth/me ────────────────────────────────────────
+// ── POST /auth/google ─────────────────────────────────────────
+app.post("/auth/google", authLimiter, async (req, res) => {
+  const { id_token } = req.body;
+  if (!id_token || typeof id_token !== "string") {
+    return res.status(400).json({ error: "id_token is required." });
+  }
+  try {
+    // Verify via Google's tokeninfo endpoint (no extra library needed)
+    const infoRes = await fetch(
+      `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(id_token)}`,
+      { signal: AbortSignal.timeout(8_000) }
+    );
+    if (!infoRes.ok) {
+      return res.status(401).json({ error: "Google token verification failed." });
+    }
+    const info = await infoRes.json();
+
+    // Validate audience (must match one of our registered client IDs)
+    if (GOOGLE_CLIENT_IDS.length > 0 && !GOOGLE_CLIENT_IDS.includes(info.aud)) {
+      log.warn("google_audience_mismatch", { aud: info.aud });
+      return res.status(401).json({ error: "Token audience mismatch." });
+    }
+
+    if (!info.email || info.email_verified !== "true") {
+      return res.status(400).json({ error: "Google account email not verified." });
+    }
+
+    const googleUserId = info.sub;
+    const email        = info.email.toLowerCase();
+    const displayName  = info.name || info.given_name || "";
+
+    // Look up by OAuth account first, then by email
+    let user = stmts.findOAuth.get("google", googleUserId);
+    let isNewUser = false;
+
+    if (!user) {
+      user = stmts.findByEmail.get(email);
+      if (!user) {
+        // Create new account
+        const userId = randomUUID();
+        stmts.createUser.run(userId, email, "OAUTH_GOOGLE", displayName);
+        user = stmts.findById.get(userId);
+        isNewUser = true;
+      }
+      // Link OAuth account
+      stmts.linkOAuth.run(randomUUID(), user.id, "google", googleUserId);
+    }
+
+    const token = await signToken(user.id);
+    log.info("google_login", { userId: anonymiseId(user.id), isNewUser });
+    return res.json({ token, isNewUser, user: userResponse(user) });
+  } catch (err) {
+    log.error("google_auth_error", { message: err.message });
+    return res.status(500).json({ error: "Google authentication failed." });
+  }
+});
+
+
+// ── POST /auth/apple ──────────────────────────────────────────
+// Cache Apple's JWKS for 1 hour to avoid repeated fetches
+let appleJWKSCache = null;
+let appleJWKSFetchedAt = 0;
+const APPLE_JWKS_TTL = 60 * 60 * 1000; // 1 hour
+
+async function getAppleJWKS() {
+  if (appleJWKSCache && Date.now() - appleJWKSFetchedAt < APPLE_JWKS_TTL) {
+    return appleJWKSCache;
+  }
+  const r = await fetch("https://appleid.apple.com/auth/keys", {
+    signal: AbortSignal.timeout(8_000),
+  });
+  if (!r.ok) throw new Error("Failed to fetch Apple JWKS");
+  const { keys } = await r.json();
+  appleJWKSCache    = keys;
+  appleJWKSFetchedAt = Date.now();
+  return keys;
+}
+
+app.post("/auth/apple", authLimiter, async (req, res) => {
+  const { identity_token, name } = req.body;
+  if (!identity_token || typeof identity_token !== "string") {
+    return res.status(400).json({ error: "identity_token is required." });
+  }
+  try {
+    // Decode header to find the right key
+    const parts = identity_token.split(".");
+    if (parts.length !== 3) {
+      return res.status(400).json({ error: "Malformed identity token." });
+    }
+    let header;
+    try {
+      header = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8"));
+    } catch {
+      return res.status(400).json({ error: "Could not decode token header." });
+    }
+
+    const keys = await getAppleJWKS();
+    const jwk  = keys.find(k => k.kid === header.kid);
+    if (!jwk) {
+      return res.status(401).json({ error: "No matching Apple key found." });
+    }
+
+    const publicKey = await importJWK(jwk);
+    const { payload } = await jwtVerify(identity_token, publicKey, {
+      issuer:   "https://appleid.apple.com",
+      audience: APPLE_BUNDLE_ID,
+    });
+
+    const appleUserId = payload.sub;
+    // Apple may provide private relay email or real email
+    const email = (payload.email || `${appleUserId}@privaterelay.appleid.com`).toLowerCase();
+
+    // Resolve name from request body (only available on first sign-in via Apple)
+    let displayName = "";
+    if (name && (name.firstName || name.lastName)) {
+      displayName = `${name.firstName || ""} ${name.lastName || ""}`.trim();
+    }
+
+    let user = stmts.findOAuth.get("apple", appleUserId);
+    let isNewUser = false;
+
+    if (!user) {
+      user = stmts.findByEmail.get(email);
+      if (!user) {
+        const userId = randomUUID();
+        stmts.createUser.run(userId, email, "OAUTH_APPLE", displayName);
+        user = stmts.findById.get(userId);
+        isNewUser = true;
+      }
+      stmts.linkOAuth.run(randomUUID(), user.id, "apple", appleUserId);
+    }
+
+    const token = await signToken(user.id);
+    log.info("apple_login", { userId: anonymiseId(user.id), isNewUser });
+    return res.json({ token, isNewUser, user: userResponse(user) });
+  } catch (err) {
+    log.error("apple_auth_error", { message: err.message });
+    return res.status(401).json({ error: "Apple authentication failed." });
+  }
+});
+
+
+// ── GET /auth/me ──────────────────────────────────────────────
 app.get("/auth/me", verifyToken, (req, res) => {
   const user = stmts.findById.get(req.userId);
   if (!user) return res.status(404).json({ error: "User not found." });
   res.json({
-    id:         anonymiseId(user.id),
-    email:      user.email,
-    name:       user.name,
-    joinedAt:   user.created_at,
-    lastScan:   user.last_scan_at,
-    scansToday: stmts.scansToday.get(user.id).n,
+    id:              anonymiseId(user.id),
+    email:           user.email,
+    name:            user.name || "",
+    joinedAt:        user.created_at,
+    lastScan:        user.last_scan_at,
+    reminder_enabled: !!user.reminder_enabled,
+    scansToday:      stmts.scansToday.get(user.id).n,
   });
 });
 
 
-// ── PREDICT: POST /scan ───────────────────────────────────────
+// ── POST /scan ────────────────────────────────────────────────
 app.post("/scan", verifyToken, checkScanRateLimit, upload.single("file"), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: "No image file uploaded." });
   }
-
   const { gender = "", race = "", age, datetime_str = "" } = req.body;
-
   if (!gender || !race || age == null) {
     return res.status(400).json({ error: "gender, race, and age are required." });
   }
-
   const ageInt = parseInt(age);
   if (isNaN(ageInt) || ageInt < 10 || ageInt > 110) {
     return res.status(400).json({ error: "age must be a number between 10 and 110." });
   }
-
-  // Whitelist / cap demographic fields to prevent downstream prompt injection
   const normGender = gender.trim().toUpperCase();
   if (!VALID_GENDERS.has(normGender)) {
     return res.status(400).json({ error: "Invalid gender value." });
@@ -344,7 +467,6 @@ app.post("/scan", verifyToken, checkScanRateLimit, upload.single("file"), async 
     return res.status(400).json({ error: "Invalid race value." });
   }
 
-  // Compress + normalise image before forwarding (~60-70% smaller)
   let processedBuffer;
   try {
     processedBuffer = await sharp(req.file.buffer)
@@ -356,8 +478,7 @@ app.post("/scan", verifyToken, checkScanRateLimit, upload.single("file"), async 
   }
 
   const anonId = anonymiseId(req.userId);
-
-  const form = new FormData();
+  const form   = new FormData();
   form.append("file",         processedBuffer, { filename: "eye.jpg", contentType: "image/jpeg" });
   form.append("gender",       normGender);
   form.append("race",         normRace);
@@ -394,7 +515,7 @@ app.post("/scan", verifyToken, checkScanRateLimit, upload.single("file"), async 
 });
 
 
-// ── EXPLAIN: GET /scan/explain/:jobId ────────────────────────
+// ── GET /scan/explain/:jobId ──────────────────────────────────
 app.get("/scan/explain/:jobId", verifyToken, async (req, res) => {
   try {
     const r = await fetch(
@@ -409,7 +530,7 @@ app.get("/scan/explain/:jobId", verifyToken, async (req, res) => {
 });
 
 
-// ── HISTORY: GET /history ─────────────────────────────────────
+// ── GET /history ──────────────────────────────────────────────
 app.get("/history", verifyToken, async (req, res) => {
   const anonId = anonymiseId(req.userId);
   const page   = Math.max(0, parseInt(req.query.page || "0"));
@@ -425,7 +546,7 @@ app.get("/history", verifyToken, async (req, res) => {
 });
 
 
-// ── TREND: GET /trend ─────────────────────────────────────────
+// ── GET /trend ────────────────────────────────────────────────
 app.get("/trend", verifyToken, async (req, res) => {
   const anonId = anonymiseId(req.userId);
   try {
@@ -440,7 +561,7 @@ app.get("/trend", verifyToken, async (req, res) => {
 });
 
 
-// ── REMINDER: POST /reminder ──────────────────────────────────
+// ── POST /reminder ────────────────────────────────────────────
 app.post("/reminder", verifyToken, (req, res) => {
   const { enabled } = req.body;
   db.prepare("UPDATE users SET reminder_enabled = ? WHERE id = ?")
@@ -465,14 +586,15 @@ app.use((err, req, res, _next) => {
 // ── START ─────────────────────────────────────────────────────
 if (NODE_ENV === "production" && !process.env.HTTPS_PROXY && !process.env.FORCE_HTTP) {
   log.warn("https_check", {
-    message: "Running in production — ensure a TLS-terminating reverse proxy is in front of this server.",
+    message: "Running in production — ensure a TLS-terminating reverse proxy is in front.",
   });
 }
 
 app.listen(PORT, () => {
   log.info("gateway_started", {
     port: PORT, env: NODE_ENV,
-    cors: CORS_ORIGINS.length > 0 ? CORS_ORIGINS : (NODE_ENV !== "production" ? "*" : "NONE"),
+    googleOAuth: GOOGLE_CLIENT_IDS.length > 0,
+    appleOAuth:  true,
     gatewayAuth: !!GATEWAY_SECRET,
   });
 });

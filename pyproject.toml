@@ -1,2 +1,0 @@
-[tool.vercel.scripts]
-app = "glauc_api:app"

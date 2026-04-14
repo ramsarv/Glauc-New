@@ -1,0 +1,91 @@
+{
+  "expo": {
+    "name": "Glauc",
+    "slug": "glauc-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "scheme": "glauc",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0A0A0F"
+    },
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.glauc.app",
+      "usesAppleSignIn": true,
+      "infoPlist": {
+        "NSCameraUsageDescription": "Glauc needs camera access to capture your eye image for ocular age analysis.",
+        "NSPhotoLibraryUsageDescription": "Glauc needs photo library access to select eye images for analysis.",
+        "NSUserNotificationsUsageDescription": "Glauc sends reminders when it's time for your next eye scan."
+      },
+      "config": {
+        "googleSignIn": {
+          "reservedClientId": "$(GOOGLE_IOS_REVERSED_CLIENT_ID)"
+        }
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0A0A0F"
+      },
+      "package": "com.glauc.app",
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.RECEIVE_BOOT_COMPLETED",
+        "android.permission.VIBRATE",
+        "android.permission.POST_NOTIFICATIONS"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png",
+      "bundler": "metro"
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Glauc needs camera access to capture your eye image for ocular age analysis."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Glauc needs photo library access to select eye images for analysis."
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/notification-icon.png",
+          "color": "#789D7F"
+        }
+      ],
+      "expo-secure-store",
+      "expo-font",
+      [
+        "@stripe/stripe-react-native",
+        {
+          "merchantIdentifier": "merchant.com.glauc.app",
+          "enableGooglePay": true
+        }
+      ]
+    ],
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/324a6816-3a00-4b9e-a747-6fe9c7b2f39f"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "324a6816-3a00-4b9e-a747-6fe9c7b2f39f"
+      }
+    }
+  }
+}

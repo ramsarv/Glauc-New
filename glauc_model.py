@@ -96,8 +96,22 @@ MAX_EXPLANATION_IMGS     = 20
 MAX_NEW_TOKENS           = 512
 THINKING_MODE            = False
 
+TEST_SPLIT = 0.10   # held-out test set (never touched during training/calibration)
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-torch.manual_seed(SEED); np.random.seed(SEED)
+
+
+def _set_seeds(seed: int = SEED):
+    """Call at the start of main() to ensure full reproducibility."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _worker_init_fn(worker_id: int):
+    """Seed each DataLoader worker independently for reproducible augmentation."""
+    np.random.seed(SEED + worker_id)
 
 
 # ── 1. FILENAME PARSER ────────────────────────────────────────────
@@ -296,15 +310,23 @@ class OcularAgeDataset(Dataset):
 
 # ── 7. STRATIFIED SPLIT ───────────────────────────────────────────
 def stratified_split(samples: List[Dict], val_fraction: float = 0.20,
-                     seed: int = 42) -> Tuple[List[int], List[int]]:
+                     test_fraction: float = 0.10,
+                     seed: int = 42) -> Tuple[List[int], List[int], List[int]]:
+    """
+    Returns (train_idx, val_idx, test_idx).
+    test_idx is a held-out set — never used for model selection or calibration.
+    """
     rng = np.random.default_rng(seed); buckets = defaultdict(list)
     for i, m in enumerate(samples): buckets[m["age"]//10].append(i)
-    train_idx, val_idx = [], []
+    train_idx, val_idx, test_idx = [], [], []
     for arr in buckets.values():
         arr = np.array(arr); rng.shuffle(arr)
-        n = max(1, math.floor(len(arr)*val_fraction))
-        val_idx.extend(arr[:n].tolist()); train_idx.extend(arr[n:].tolist())
-    return train_idx, val_idx
+        n_test = max(1, math.floor(len(arr) * test_fraction))
+        n_val  = max(1, math.floor(len(arr) * val_fraction))
+        test_idx.extend(arr[:n_test].tolist())
+        val_idx.extend(arr[n_test:n_test + n_val].tolist())
+        train_idx.extend(arr[n_test + n_val:].tolist())
+    return train_idx, val_idx, test_idx
 
 
 # ── 8. MC DROPOUT CONTEXT MANAGER ────────────────────────────────
@@ -373,7 +395,7 @@ class GlaucDINOv3(nn.Module):
         f  = self.backbone(images)
         s  = self.trunk(torch.cat([f, self.gender_emb(gender_ids),
                                       self.race_emb(race_ids)], dim=1))
-        age    = self.age_head(s).squeeze(1) * self.temperature
+        age    = torch.clamp(self.age_head(s).squeeze(1) * self.temperature, 0.0, 120.0)
         glauc  = torch.sigmoid(self.glauc_head(s)).squeeze(1)
         dr     = torch.sigmoid(self.dr_head(s)).squeeze(1)
         cardio = torch.sigmoid(self.cardio_head(s)).squeeze(1)
@@ -734,31 +756,47 @@ def save_summary(train_h, val_h, mc_results, vocab, n_rejected,
 def main():
     from glauc_analysis import (run_calibration, plot_reliability_diagram, plot_gradcam_grid)
 
-    log.info("="*58); log.info("  GLAUC Production Pipeline  v3.0"); log.info("="*58)
+    # Seed all RNGs at the top of main for full reproducibility
+    _set_seeds(SEED)
 
-    log.info("[1/9] Dataset scan...")
+    log.info("="*58); log.info("  GLAUC Production Pipeline  v3.1"); log.info("="*58)
+
+    log.info("[1/10] Dataset scan...")
     base_ds = OcularAgeDataset(IMAGE_DIR, transform=TRAIN_TRANSFORM, use_eye_crop=True, eye_side="both")
     if not base_ds.samples: log.error("No valid images. Exiting."); return
-    vocab = base_ds.vocab; n_rejected = len(base_ds.skipped)
+    n_rejected = len(base_ds.skipped)
+
+    # Three-way stratified split: train / val / test
+    train_idx, val_idx, test_idx = stratified_split(base_ds.samples, VAL_SPLIT, TEST_SPLIT, SEED)
+    log.info(f"Train {len(train_idx)} | Val {len(val_idx)} | Test {len(test_idx)} | Rejected {n_rejected}")
+
+    # Vocab built from train samples only — no information leakage from val/test demographics
+    train_samples = [base_ds.samples[i] for i in train_idx]
+    vocab = DemographicVocab(train_samples)
+    base_ds.vocab = vocab  # update dataset reference
     vocab.save(os.path.join(OUTPUT_DIR, "vocab.json"))
 
-    train_idx, val_idx = stratified_split(base_ds.samples, VAL_SPLIT, SEED)
-    log.info(f"Train {len(train_idx)} | Val {len(val_idx)} | Rejected {n_rejected}")
     train_set = Subset(base_ds, train_idx)
     val_ds    = OcularAgeDataset(IMAGE_DIR, vocab=vocab, transform=VAL_TRANSFORM,
                                   use_eye_crop=True, eye_side="both", samples=base_ds.samples)
-    val_set   = Subset(val_ds, val_idx)
-    dl_kw = dict(num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=NUM_WORKERS>0)
+    test_ds   = OcularAgeDataset(IMAGE_DIR, vocab=vocab, transform=VAL_TRANSFORM,
+                                  use_eye_crop=True, eye_side="both", samples=base_ds.samples)
+    val_set   = Subset(val_ds,  val_idx)
+    test_set  = Subset(test_ds, test_idx)
+
+    dl_kw = dict(num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=NUM_WORKERS>0,
+                 worker_init_fn=_worker_init_fn)
     train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True,  **dl_kw)
     val_loader   = DataLoader(val_set,   batch_size=BATCH_SIZE, shuffle=False, **dl_kw)
+    test_loader  = DataLoader(test_set,  batch_size=BATCH_SIZE, shuffle=False, **dl_kw)
 
-    log.info("[2/9] Building model...")
+    log.info("[2/10] Building model...")
     model = GlaucDINOv3(DINOV3_MODEL, vocab.num_genders, vocab.num_races).to(DEVICE)
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
                              lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=LR_MIN)
 
-    log.info(f"[3/9] Training (max {EPOCHS} epochs, patience={EARLY_STOP_PATIENCE})...")
+    log.info(f"[3/10] Training (max {EPOCHS} epochs, patience={EARLY_STOP_PATIENCE})...")
     train_h = defaultdict(list); val_h = defaultdict(list)
     best_mae = float("inf"); patience = 0; stopped = EPOCHS
     ckpt = os.path.join(OUTPUT_DIR, "best_model.pt")
@@ -772,35 +810,50 @@ def main():
         train_h["lr"].append(lr_now)
         log.info(f"Ep {epoch:3d}/{EPOCHS} | tr {tr['mae']:.2f} vl {vl['mae']:.2f} | lr {lr_now:.2e}")
         if vl["mae"] < best_mae:
-            best_mae = vl["mae"]; patience = 0; torch.save(model.state_dict(), ckpt)
+            best_mae = vl["mae"]; patience = 0
+            # Save full checkpoint (model + optimizer + epoch) for resumable training
+            torch.save({
+                "model":     model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "epoch":     epoch,
+                "val_mae":   best_mae,
+            }, ckpt)
         else:
             patience += 1
             if patience >= EARLY_STOP_PATIENCE:
                 log.info(f"Early stop at epoch {epoch}"); stopped = epoch; break
 
-    model.load_state_dict(torch.load(ckpt, map_location=DEVICE)); model.eval()
+    # Load best checkpoint (backward-compatible with old plain state_dict format)
+    ckpt_data = torch.load(ckpt, map_location=DEVICE)
+    model.load_state_dict(ckpt_data["model"] if isinstance(ckpt_data, dict) and "model" in ckpt_data else ckpt_data)
+    model.eval()
 
-    log.info("[4/9] Training plots..."); plot_training_curves(train_h, val_h, OUTPUT_DIR)
+    log.info("[4/10] Training plots..."); plot_training_curves(train_h, val_h, OUTPUT_DIR)
 
-    log.info("[5/9] Temperature calibration...")
+    log.info("[5/10] Temperature calibration (val set)...")
     temperature = run_calibration(model, val_loader, DEVICE, OUTPUT_DIR)
     plot_reliability_diagram(model, val_loader, DEVICE, OUTPUT_DIR)
     log.info(f"  Optimal temperature: {temperature:.4f}")
 
-    log.info(f"[6/9] MC + TTA inference ({MC_DROPOUT_PASSES} passes × {TTA_VIEWS} views)...")
+    log.info(f"[6/10] MC + TTA inference on val set ({MC_DROPOUT_PASSES} passes × {TTA_VIEWS} views)...")
     mc = run_mc_inference(model, val_loader, DEVICE, use_tta=True)
     plot_predictions_with_uncertainty(mc, OUTPUT_DIR)
     plot_demographic_breakdown(mc, OUTPUT_DIR); plot_risk_scores(mc, OUTPUT_DIR)
 
-    log.info("[7/9] GradCAM heatmaps...")
+    log.info(f"[7/10] MC + TTA inference on held-out test set...")
+    mc_test = run_mc_inference(model, test_loader, DEVICE, use_tta=True)
+    test_mae = np.mean([abs(r["age_mean"] - r["actual_age"]) for r in mc_test])
+    log.info(f"  Test MAE (unseen): {test_mae:.2f} yrs  (n={len(mc_test)})")
+
+    log.info("[8/10] GradCAM heatmaps...")
     plot_gradcam_grid(model, val_ds, val_idx[:12], DEVICE, OUTPUT_DIR)
 
-    log.info("[8/9] Bias audit...")
+    log.info("[9/10] Bias audit...")
     flagged = run_bias_audit(mc, OUTPUT_DIR)
 
     explanations = []
     if RUN_EXPLANATIONS:
-        log.info(f"[9/9] Qwen3-VL explanations ({MAX_EXPLANATION_IMGS} images)...")
+        log.info(f"[10/10] Qwen3-VL explanations ({MAX_EXPLANATION_IMGS} images)...")
         meta_map  = {m["filename"]: m for m in val_ds.samples}
         explainer = GlaucExplainer(QWEN_MODEL_ID, DEVICE, THINKING_MODE)
         for i, r in enumerate(mc[:MAX_EXPLANATION_IMGS]):
@@ -817,7 +870,7 @@ def main():
         if torch.cuda.is_available(): torch.cuda.empty_cache()
         save_explanations_txt(explanations, OUTPUT_DIR)
     else:
-        log.info("[9/9] Explanations skipped.")
+        log.info("[10/10] Explanations skipped.")
 
     save_predictions_csv(mc, explanations, OUTPUT_DIR)
     save_summary(train_h, val_h, mc, vocab, n_rejected, flagged,
@@ -825,7 +878,8 @@ def main():
     final_mae = np.mean([abs(r["age_mean"]-r["actual_age"]) for r in mc])
     log.info("="*58)
     log.info(f"  Best Val MAE   : {best_mae:.2f} yrs")
-    log.info(f"  MC+TTA MAE     : {final_mae:.2f} yrs")
+    log.info(f"  Val MC+TTA MAE : {final_mae:.2f} yrs")
+    log.info(f"  Test MAE       : {test_mae:.2f} yrs  ← held-out, unseen")
     log.info(f"  Temperature    : {temperature:.4f}")
     log.info(f"  Stopped epoch  : {stopped}")
     log.info(f"  Bias flags     : {len(flagged)}")

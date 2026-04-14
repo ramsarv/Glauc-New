@@ -1,203 +1,120 @@
 /**
- * ProfileScreen — User account, reminder settings, sign out.
- * Loads real user data from AuthContext, toggles push notifications.
+ * ProfileScreen v2 — Subscription status + settings navigation.
  */
 
 import React, { useState, useCallback, useEffect } from 'react';
 import {
-  View, Text, StyleSheet, Switch, TouchableOpacity,
-  ScrollView, Alert, ActivityIndicator, Platform,
+  View, Text, StyleSheet, TouchableOpacity, ScrollView,
+  ActivityIndicator,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
-import * as Notifications from 'expo-notifications';
-import * as Device from 'expo-device';
-import Constants from 'expo-constants';
-import { T } from '../constants/theme';
+import { T, PLANS } from '../constants/theme';
 import Card from '../components/Card';
-import GhostButton from '../components/GhostButton';
 import { useAuth } from '../context/AuthContext';
-import { apiSetReminder } from '../services/api';
+import { apiGetSubscription } from '../services/api';
 
-Notifications.setNotificationHandler({
-  handleNotification: async () => ({
-    shouldShowAlert: true,
-    shouldPlaySound: false,
-    shouldSetBadge:  false,
-  }),
-});
+export default function ProfileScreen({ navigation }) {
+  const { user } = useAuth();
+  const [sub, setSub] = useState(null);
+  const [loadSub, setLoadSub] = useState(true);
 
-export default function ProfileScreen() {
-  const { user, signOut, refreshUser } = useAuth();
-
-  const [reminder,   setReminder]   = useState(user?.reminder_enabled ?? true);
-  const [toggling,   setToggling]   = useState(false);
-  const [signingOut, setSigningOut] = useState(false);
-
-  // Sync reminder state when user data updates
   useEffect(() => {
-    if (user?.reminder_enabled != null) {
-      setReminder(!!user.reminder_enabled);
-    }
-  }, [user?.reminder_enabled]);
-
-  // ── Notification permission + token ────────────────────────
-  const requestNotificationPermission = useCallback(async () => {
-    if (!Device.isDevice) return null; // Simulator — no push tokens
-    const { status: existing } = await Notifications.getPermissionsAsync();
-    if (existing === 'granted') return existing;
-    const { status } = await Notifications.requestPermissionsAsync();
-    return status;
+    apiGetSubscription()
+      .then(s => setSub(s))
+      .catch(() => setSub(null))
+      .finally(() => setLoadSub(false));
   }, []);
 
-  // ── Toggle reminder ─────────────────────────────────────────
-  const handleReminderToggle = useCallback(async (value) => {
-    setToggling(true);
-    try {
-      if (value) {
-        const status = await requestNotificationPermission();
-        if (status !== 'granted') {
-          Alert.alert(
-            'Notifications Blocked',
-            'Enable notifications in Settings to receive 90-day retest reminders.',
-          );
-          setToggling(false);
-          return;
-        }
-      }
-      await apiSetReminder(value);
-      setReminder(value);
-    } catch (err) {
-      Alert.alert('Error', err.message || 'Could not update reminder setting.');
-    } finally {
-      setToggling(false);
-    }
-  }, [requestNotificationPermission]);
-
-  // ── Sign out ────────────────────────────────────────────────
-  const handleSignOut = useCallback(() => {
-    Alert.alert(
-      'Sign Out',
-      'Are you sure you want to sign out?',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Sign Out',
-          style: 'destructive',
-          onPress: async () => {
-            setSigningOut(true);
-            await signOut();
-          },
-        },
-      ]
-    );
-  }, [signOut]);
+  const planInfo = sub ? PLANS.find(p => p.id === sub.plan) : null;
 
   const joinedDate = user?.joinedAt
     ? new Date(user.joinedAt).toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
     : null;
-
-  const lastScanDate = user?.lastScan
+  const lastScan = user?.lastScan
     ? new Date(user.lastScan).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
     : 'Never';
 
   return (
-    <SafeAreaView style={styles.safe} edges={['top', 'bottom']}>
-      <LinearGradient
-        colors={[`${T.amber}10`, T.obsidian]}
-        start={{ x: 0.5, y: 0 }}
-        end={{ x: 0.5, y: 0.4 }}
-        style={StyleSheet.absoluteFill}
-      />
+    <SafeAreaView style={s.safe} edges={['top']}>
+      <LinearGradient colors={[`${T.sage}0A`, T.bgDeep]} start={{ x: 0.5, y: 0 }} end={{ x: 0.5, y: 0.35 }} style={StyleSheet.absoluteFill} />
 
-      <ScrollView contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false}>
-        <Text style={styles.heading}>Profile</Text>
+      <ScrollView contentContainerStyle={s.scroll} showsVerticalScrollIndicator={false}>
+        {/* Header row */}
+        <View style={s.topRow}>
+          <Text style={s.heading}>Profile</Text>
+          <TouchableOpacity onPress={() => navigation.navigate('Settings')} style={s.settingsBtn} accessibilityRole="button" accessibilityLabel="Open Settings">
+            <Text style={s.settingsIco}>⚙</Text>
+          </TouchableOpacity>
+        </View>
 
-        {/* ── Account Info ──────────────────────────────────── */}
-        <Card style={styles.section}>
-          <View style={styles.avatarRow}>
-            <View style={styles.avatar}>
-              <Text style={styles.avatarInitial}>
+        {/* Avatar + identity */}
+        <Card style={s.identityCard}>
+          <View style={s.avatarRow}>
+            <View style={s.avatar}>
+              <Text style={s.avatarTxt}>
                 {(user?.name?.[0] || user?.email?.[0] || '?').toUpperCase()}
               </Text>
             </View>
-            <View style={styles.userInfo}>
-              {user?.name ? (
-                <Text style={styles.userName}>{user.name}</Text>
-              ) : null}
-              <Text style={styles.userEmail}>{user?.email || '—'}</Text>
-              {joinedDate && (
-                <Text style={styles.userMeta}>Member since {joinedDate}</Text>
-              )}
+            <View style={s.identity}>
+              {user?.name ? <Text style={s.name}>{user.name}</Text> : null}
+              <Text style={s.email}>{user?.email || '—'}</Text>
+              {joinedDate && <Text style={s.meta}>Member since {joinedDate}</Text>}
             </View>
           </View>
         </Card>
 
-        {/* ── Scan Stats ───────────────────────────────────── */}
-        <Card style={styles.section}>
-          <Text style={styles.sectionTitle}>Scan Activity</Text>
+        {/* Subscription status */}
+        <Card style={s.sec}>
+          <Text style={s.secTitle}>Subscription</Text>
+          {loadSub ? (
+            <ActivityIndicator color={T.sage} style={{ paddingVertical: 12 }} />
+          ) : sub?.status === 'active' ? (
+            <View>
+              <View style={s.subActive}>
+                <View style={s.subDot} />
+                <Text style={s.subPlan}>{planInfo?.label || sub.plan}</Text>
+              </View>
+              {sub.currentPeriodEnd && (
+                <Text style={s.subExpiry}>
+                  Renews {new Date(sub.currentPeriodEnd).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
+                </Text>
+              )}
+              <TouchableOpacity onPress={() => navigation.navigate('Settings')} style={s.manageBtn}>
+                <Text style={s.manageTxt}>Manage Plan →</Text>
+              </TouchableOpacity>
+            </View>
+          ) : (
+            <View>
+              <Text style={s.noSub}>No active subscription</Text>
+              <TouchableOpacity onPress={() => navigation.navigate('Subscription')} style={s.upgradeBtn} activeOpacity={0.85}>
+                <Text style={s.upgradeTxt}>Choose a Plan</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+        </Card>
+
+        {/* Scan stats */}
+        <Card style={s.sec}>
+          <Text style={s.secTitle}>Scan Activity</Text>
           <StatRow label="Scans today" value={String(user?.scansToday ?? 0)} />
-          <StatRow label="Last scan"   value={lastScanDate} />
+          <StatRow label="Last scan"   value={lastScan} />
           <StatRow label="Daily limit" value="10 scans" />
         </Card>
 
-        {/* ── Notifications ────────────────────────────────── */}
-        <Card style={styles.section}>
-          <Text style={styles.sectionTitle}>Notifications</Text>
-          <View style={styles.settingRow}>
-            <View style={styles.settingLeft}>
-              <Text style={styles.settingLabel}>90-Day Retest Reminder</Text>
-              <Text style={styles.settingDesc}>
-                Get reminded when it's time for your next ocular scan.
-              </Text>
-            </View>
-            {toggling ? (
-              <ActivityIndicator color={T.amber} size="small" />
-            ) : (
-              <Switch
-                value={reminder}
-                onValueChange={handleReminderToggle}
-                trackColor={{ false: T.border, true: `${T.amber}60` }}
-                thumbColor={reminder ? T.amber : T.creamLow}
-                ios_backgroundColor={T.border}
-              />
-            )}
-          </View>
+        {/* Quick links */}
+        <Card style={s.sec}>
+          <Text style={s.secTitle}>Account</Text>
+          <ActionRow label="Settings"          onPress={() => navigation.navigate('Settings')} />
+          <ActionRow label="Manage Subscription" onPress={() => navigation.navigate('Subscription')} />
+          <ActionRow label="Privacy Policy"    onPress={() => {}} />
+          <ActionRow label="Terms of Service"  onPress={() => {}} />
         </Card>
 
-        {/* ── About ────────────────────────────────────────── */}
-        <Card style={styles.section}>
-          <Text style={styles.sectionTitle}>About</Text>
-          <StatRow label="App version"    value={Constants.expoConfig?.version || '1.0.0'} />
-          <StatRow label="Model"          value="DINOv3 ViT-B/14" />
-          <StatRow label="Analysis"       value="Qwen3-VL-8B" />
-          <StatRow label="Inference"      value="MC Dropout + TTA" />
-        </Card>
-
-        {/* ── Legal ────────────────────────────────────────── */}
-        <Card style={styles.section}>
-          <Text style={styles.sectionTitle}>Legal</Text>
-          <Text style={styles.legalText}>
-            Glauc is a wellness application for informational purposes only. It is not a
-            medical device and does not provide medical diagnoses or treatment recommendations.
-            Always consult a qualified ophthalmologist for clinical assessment.
-          </Text>
-        </Card>
-
-        {/* ── Sign Out ─────────────────────────────────────── */}
-        <View style={styles.signOutWrap}>
-          {signingOut ? (
-            <ActivityIndicator color={T.red} />
-          ) : (
-            <GhostButton
-              onPress={handleSignOut}
-              style={styles.signOutBtn}
-              textStyle={styles.signOutText}
-            >
-              Sign Out
-            </GhostButton>
-          )}
-        </View>
+        <Text style={s.disclaimer}>
+          Glauc is for wellness use only.{'\n'}
+          Not a medical device or clinical diagnostic tool.
+        </Text>
       </ScrollView>
     </SafeAreaView>
   );
@@ -205,117 +122,63 @@ export default function ProfileScreen() {
 
 function StatRow({ label, value }) {
   return (
-    <View style={statStyles.row}>
-      <Text style={statStyles.label}>{label}</Text>
-      <Text style={statStyles.value}>{value}</Text>
+    <View style={r.row}>
+      <Text style={r.label}>{label}</Text>
+      <Text style={r.value}>{value}</Text>
     </View>
   );
 }
 
-const statStyles = StyleSheet.create({
-  row: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingVertical: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: T.border,
-  },
-  label: {
-    fontFamily: T.body,
-    fontSize: 14,
-    color: T.creamMid,
-  },
-  value: {
-    fontFamily: T.bodyMed,
-    fontSize: 14,
-    color: T.cream,
-  },
+function ActionRow({ label, onPress }) {
+  return (
+    <TouchableOpacity onPress={onPress} style={r.row} activeOpacity={0.75} accessibilityRole="button">
+      <Text style={r.label}>{label}</Text>
+      <Text style={r.chevron}>›</Text>
+    </TouchableOpacity>
+  );
+}
+
+const r = StyleSheet.create({
+  row:    { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: T.border },
+  label:  { fontFamily: T.body,    fontSize: 14, color: T.cream  },
+  value:  { fontFamily: T.bodyMed, fontSize: 14, color: T.white  },
+  chevron:{ fontFamily: T.bodyMed, fontSize: 20, color: T.faint, lineHeight: 22 },
 });
 
-const styles = StyleSheet.create({
-  safe:   { flex: 1, backgroundColor: T.obsidian },
-  scroll: { paddingHorizontal: 20, paddingBottom: 48 },
+const s = StyleSheet.create({
+  safe:   { flex: 1, backgroundColor: T.bgDeep },
+  scroll: { paddingHorizontal: 20, paddingBottom: 100 },
+  topRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingTop: 24, marginBottom: 18 },
+  heading:{ fontFamily: T.display, fontSize: 32, color: T.white },
+  settingsBtn:{ width: 44, height: 44, borderRadius: 22, backgroundColor: T.surface, borderWidth: 1, borderColor: T.border, alignItems: 'center', justifyContent: 'center' },
+  settingsIco:{ fontSize: 18, color: T.muted },
 
-  heading: {
-    fontFamily: T.display,
-    fontSize: 30,
-    color: T.cream,
-    marginTop: 20,
-    marginBottom: 16,
-  },
-
-  section: { padding: 20, marginBottom: 12 },
-  sectionTitle: {
-    fontFamily: T.bodyMed,
-    fontSize: 13,
-    color: T.creamMid,
-    letterSpacing: 0.5,
-    marginBottom: 14,
-  },
-
+  identityCard: { padding: 20, marginBottom: 14 },
   avatarRow: { flexDirection: 'row', alignItems: 'center', gap: 16 },
   avatar: {
-    width: 56, height: 56,
-    borderRadius: 28,
-    backgroundColor: T.amberGlow,
-    borderWidth: 2,
-    borderColor: `${T.amber}40`,
-    alignItems: 'center',
-    justifyContent: 'center',
+    width: 60, height: 60, borderRadius: 30,
+    backgroundColor: T.sageSoft, borderWidth: 2, borderColor: `${T.sage}40`,
+    alignItems: 'center', justifyContent: 'center',
   },
-  avatarInitial: {
-    fontFamily: T.displayBold,
-    fontSize: 22,
-    color: T.amber,
-  },
-  userInfo:   { flex: 1 },
-  userName: {
-    fontFamily: T.bodyMed,
-    fontSize: 16,
-    color: T.cream,
-    marginBottom: 2,
-  },
-  userEmail: {
-    fontFamily: T.body,
-    fontSize: 13,
-    color: T.creamMid,
-  },
-  userMeta: {
-    fontFamily: T.bodyLight,
-    fontSize: 12,
-    color: T.creamLow,
-    marginTop: 2,
-  },
+  avatarTxt: { fontFamily: T.display,  fontSize: 24, color: T.sage },
+  identity:  { flex: 1 },
+  name:  { fontFamily: T.bodyMed, fontSize: 17, color: T.white, marginBottom: 2 },
+  email: { fontFamily: T.body,    fontSize: 13, color: T.muted  },
+  meta:  { fontFamily: T.bodyLight,fontSize: 12, color: T.faint, marginTop: 2 },
 
-  settingRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 12,
-  },
-  settingLeft:  { flex: 1 },
-  settingLabel: {
-    fontFamily: T.bodyMed,
-    fontSize: 14,
-    color: T.cream,
-    marginBottom: 4,
-  },
-  settingDesc: {
-    fontFamily: T.bodyLight,
-    fontSize: 12,
-    color: T.creamMid,
-    lineHeight: 18,
-  },
+  sec:     { padding: 20, marginBottom: 14 },
+  secTitle:{ fontFamily: T.bodySemi, fontSize: 11, color: T.sage, letterSpacing: 1.2, marginBottom: 14 },
 
-  legalText: {
-    fontFamily: T.body,
-    fontSize: 13,
-    color: T.creamMid,
-    lineHeight: 22,
-  },
+  subActive: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 4 },
+  subDot:  { width: 8, height: 8, borderRadius: 4, backgroundColor: T.sage },
+  subPlan: { fontFamily: T.bodyMed, fontSize: 15, color: T.white },
+  subExpiry:{ fontFamily: T.body, fontSize: 12, color: T.muted, marginBottom: 12 },
+  manageBtn:{ paddingVertical: 4 },
+  manageTxt:{ fontFamily: T.bodyMed, fontSize: 13, color: T.lavender },
 
-  signOutWrap: { marginTop: 8, marginBottom: 24 },
-  signOutBtn:  { borderColor: `${T.red}40` },
-  signOutText: { color: T.red },
+  noSub:    { fontFamily: T.body, fontSize: 14, color: T.muted, marginBottom: 14 },
+  upgradeBtn:{ backgroundColor: T.sage, borderRadius: T.rm, paddingVertical: 12, alignItems: 'center' },
+  upgradeTxt:{ fontFamily: T.bodyMed, fontSize: 14, color: T.bgDeep },
+
+  disclaimer:{ fontFamily: T.bodyLight, fontSize: 11, color: T.faint, textAlign: 'center', lineHeight: 18, marginTop: 8 },
 });

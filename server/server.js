@@ -1,7 +1,15 @@
 /**
- * glauc-gateway/server.js  v1.2
+ * glauc-gateway/server.js  v1.3
  * ══════════════════════════════════════════════════════════════
  * Production-hardened Node.js API Gateway.
+ *
+ * v1.3 additions:
+ *   • Stripe subscription system (PaymentIntents + webhook)
+ *   • subscriptions table — plan, status, period tracking
+ *   • POST /subscription/create-payment-intent
+ *   • POST /subscription/activate
+ *   • GET  /subscription/status
+ *   • POST /webhook/stripe (raw body, signature verified)
  *
  * v1.2 additions:
  *   • POST /auth/google — verifies Google ID token via tokeninfo endpoint
@@ -24,6 +32,7 @@ import { fileURLToPath } from "url";
 import bcryptjs       from "bcryptjs";
 import rateLimit      from "express-rate-limit";
 import helmet         from "helmet";
+import Stripe         from "stripe";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -61,6 +70,29 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || "")
   .split(",").map(s => s.trim()).filter(Boolean);
 
 const VALID_GENDERS = new Set(["M", "F", "MALE", "FEMALE", "OTHER"]);
+
+// ── STRIPE ────────────────────────────────────────────────────
+const stripe = process.env.STRIPE_SECRET_KEY
+  ? new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" })
+  : null;
+
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
+
+// Plan amounts in cents (USD). Matches PLANS in theme.js.
+const PLAN_AMOUNTS = {
+  single_once:            1900,   // $19 — one-time
+  comprehensive_once:     2900,   // $29 — one-time
+  single_weekly:          2400,   // $24/mo (≈ $6/week × 4)
+  comprehensive_weekly:   3600,   // $36/mo (≈ $9/week × 4)
+};
+
+// Period (days) to grant after successful payment
+const PLAN_PERIOD_DAYS = {
+  single_once:          365,   // one-time purchase — 1 year access
+  comprehensive_once:   365,
+  single_weekly:         30,   // renewable monthly
+  comprehensive_weekly:  30,
+};
 
 
 // ── STRUCTURED LOGGER ─────────────────────────────────────────
@@ -103,6 +135,20 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT (datetime('now','utc')),
     FOREIGN KEY (user_id) REFERENCES users(id)
   );
+
+  CREATE TABLE IF NOT EXISTS subscriptions (
+    id               TEXT PRIMARY KEY,
+    user_id          TEXT NOT NULL UNIQUE,
+    plan_id          TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'active',
+    payment_intent   TEXT,
+    stripe_customer  TEXT,
+    period_start     TEXT NOT NULL DEFAULT (datetime('now','utc')),
+    period_end       TEXT,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now','utc')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now','utc')),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
 `);
 
 const stmts = {
@@ -114,11 +160,90 @@ const stmts = {
   scansToday:       db.prepare("SELECT COUNT(*) AS n FROM scan_log WHERE user_id = ? AND date(created_at) = date('now','utc')"),
   logScan:          db.prepare("INSERT INTO scan_log (id, user_id) VALUES (?, ?)"),
   updateLastScan:   db.prepare("UPDATE users SET last_scan_at = datetime('now','utc') WHERE id = ?"),
+
+  // Subscription
+  getSub:    db.prepare("SELECT * FROM subscriptions WHERE user_id = ?"),
+  getSubByPI:db.prepare("SELECT * FROM subscriptions WHERE payment_intent = ?"),
+  upsertSub: db.prepare(`
+    INSERT INTO subscriptions (id, user_id, plan_id, status, payment_intent, stripe_customer, period_start, period_end)
+    VALUES (?, ?, ?, ?, ?, ?, datetime('now','utc'), ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+      plan_id         = excluded.plan_id,
+      status          = excluded.status,
+      payment_intent  = excluded.payment_intent,
+      stripe_customer = excluded.stripe_customer,
+      period_start    = datetime('now','utc'),
+      period_end      = excluded.period_end,
+      updated_at      = datetime('now','utc')
+  `),
+  updateSubStatus: db.prepare(
+    "UPDATE subscriptions SET status = ?, updated_at = datetime('now','utc') WHERE user_id = ?"
+  ),
+  updateSubByPI: db.prepare(`
+    UPDATE subscriptions
+    SET status = ?, period_start = datetime('now','utc'), period_end = ?,
+        updated_at = datetime('now','utc')
+    WHERE payment_intent = ?
+  `),
 };
 
 
 // ── APP ───────────────────────────────────────────────────────
 const app    = express();
+
+// ── STRIPE WEBHOOK (raw body — must be before express.json()) ─
+// Stripe requires the raw request body to verify the signature.
+app.post(
+  "/webhook/stripe",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    if (!stripe) return res.status(503).json({ error: "Stripe not configured." });
+
+    const sig = req.headers["stripe-signature"];
+    if (!sig || !STRIPE_WEBHOOK_SECRET) {
+      log.warn("stripe_webhook_missing_sig");
+      return res.status(400).json({ error: "Missing stripe-signature header." });
+    }
+
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+    } catch (err) {
+      log.warn("stripe_webhook_invalid_sig", { message: err.message });
+      return res.status(400).json({ error: `Webhook signature invalid: ${err.message}` });
+    }
+
+    try {
+      switch (event.type) {
+        case "payment_intent.succeeded": {
+          const pi = event.data.object;
+          const sub = stmts.getSubByPI.get(pi.id);
+          if (sub) {
+            const planId = sub.plan_id;
+            const days   = PLAN_PERIOD_DAYS[planId] || 30;
+            const periodEnd = new Date(Date.now() + days * 86_400_000).toISOString();
+            stmts.updateSubByPI.run("active", periodEnd, pi.id);
+            log.info("stripe_payment_succeeded", { piId: pi.id });
+          }
+          break;
+        }
+        case "payment_intent.payment_failed": {
+          const pi = event.data.object;
+          stmts.updateSubByPI.run("payment_failed", null, pi.id);
+          log.warn("stripe_payment_failed", { piId: pi.id });
+          break;
+        }
+        default:
+          break;
+      }
+    } catch (err) {
+      log.error("stripe_webhook_handler", { message: err.message });
+    }
+
+    res.json({ received: true });
+  }
+);
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits:  { fileSize: MAX_FILE_MB * 1024 * 1024 },
@@ -567,6 +692,151 @@ app.post("/reminder", verifyToken, (req, res) => {
   db.prepare("UPDATE users SET reminder_enabled = ? WHERE id = ?")
     .run(enabled ? 1 : 0, req.userId);
   return res.json({ success: true, reminder_enabled: !!enabled });
+});
+
+
+// ══════════════════════════════════════════════════════════════
+// SUBSCRIPTION ENDPOINTS
+// ══════════════════════════════════════════════════════════════
+
+// ── POST /subscription/create-payment-intent ──────────────────
+// Creates a Stripe PaymentIntent for the selected plan.
+// Client uses the returned clientSecret to present PaymentSheet.
+app.post("/subscription/create-payment-intent", verifyToken, async (req, res) => {
+  if (!stripe) {
+    return res.status(503).json({ error: "Payment processing is not configured." });
+  }
+
+  const { plan_id } = req.body;
+  if (!plan_id || !PLAN_AMOUNTS[plan_id]) {
+    return res.status(400).json({ error: "Invalid plan_id." });
+  }
+
+  const amount   = PLAN_AMOUNTS[plan_id];
+  const anonId   = anonymiseId(req.userId);
+
+  try {
+    // Create or retrieve a Stripe Customer for idempotent billing
+    const existingSub = stmts.getSub.get(req.userId);
+    let customerId = existingSub?.stripe_customer || null;
+
+    if (!customerId) {
+      const user     = stmts.findById.get(req.userId);
+      const customer = await stripe.customers.create({
+        email:    user?.email,
+        metadata: { internal_id: anonId },
+      });
+      customerId = customer.id;
+    }
+
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount,
+      currency:              "usd",
+      customer:              customerId,
+      setup_future_usage:    "off_session",   // save card for renewals
+      metadata:              { plan_id, internal_id: anonId },
+      automatic_payment_methods: { enabled: true },
+    });
+
+    // Reserve the subscription row so the webhook can find it
+    const days      = PLAN_PERIOD_DAYS[plan_id] || 30;
+    const periodEnd = new Date(Date.now() + days * 86_400_000).toISOString();
+    stmts.upsertSub.run(
+      randomUUID(), req.userId, plan_id, "pending",
+      paymentIntent.id, customerId, periodEnd
+    );
+
+    log.info("payment_intent_created", { userId: anonId, plan_id });
+    return res.json({
+      clientSecret:    paymentIntent.client_secret,
+      paymentIntentId: paymentIntent.id,
+      customerId,
+      amount,
+    });
+  } catch (err) {
+    log.error("create_payment_intent_error", { message: err.message });
+    return res.status(500).json({ error: "Failed to create payment intent." });
+  }
+});
+
+
+// ── POST /subscription/activate ───────────────────────────────
+// Called after PaymentSheet completes successfully on the client.
+// Verifies the PaymentIntent status with Stripe before activating.
+app.post("/subscription/activate", verifyToken, async (req, res) => {
+  if (!stripe) {
+    return res.status(503).json({ error: "Payment processing is not configured." });
+  }
+
+  const { payment_intent_id, plan_id } = req.body;
+  if (!payment_intent_id || !plan_id) {
+    return res.status(400).json({ error: "payment_intent_id and plan_id are required." });
+  }
+  if (!PLAN_AMOUNTS[plan_id]) {
+    return res.status(400).json({ error: "Invalid plan_id." });
+  }
+
+  try {
+    const pi = await stripe.paymentIntents.retrieve(payment_intent_id);
+
+    if (pi.status !== "succeeded") {
+      log.warn("activate_payment_not_succeeded", { piId: payment_intent_id, status: pi.status });
+      return res.status(402).json({
+        error:  "Payment not completed.",
+        status: pi.status,
+      });
+    }
+
+    // Verify the plan matches what was originally created
+    if (pi.metadata?.plan_id !== plan_id) {
+      log.warn("activate_plan_mismatch", { expected: pi.metadata?.plan_id, got: plan_id });
+      return res.status(400).json({ error: "Plan mismatch." });
+    }
+
+    const days      = PLAN_PERIOD_DAYS[plan_id] || 30;
+    const periodEnd = new Date(Date.now() + days * 86_400_000).toISOString();
+
+    stmts.upsertSub.run(
+      randomUUID(), req.userId, plan_id, "active",
+      payment_intent_id, pi.customer || null, periodEnd
+    );
+
+    log.info("subscription_activated", { userId: anonymiseId(req.userId), plan_id });
+    return res.json({
+      success:         true,
+      status:          "active",
+      plan:            plan_id,
+      currentPeriodEnd: periodEnd,
+    });
+  } catch (err) {
+    log.error("activate_subscription_error", { message: err.message });
+    return res.status(500).json({ error: "Failed to activate subscription." });
+  }
+});
+
+
+// ── GET /subscription/status ──────────────────────────────────
+// Returns the user's current subscription or null if none.
+app.get("/subscription/status", verifyToken, (req, res) => {
+  try {
+    const sub = stmts.getSub.get(req.userId);
+    if (!sub) return res.json(null);
+
+    // Expire if period_end has passed
+    const isExpired = sub.period_end && new Date(sub.period_end) < new Date();
+    const status    = isExpired ? "expired" : sub.status;
+
+    return res.json({
+      status,
+      plan:             sub.plan_id,
+      currentPeriodEnd: sub.period_end,
+      periodStart:      sub.period_start,
+      createdAt:        sub.created_at,
+    });
+  } catch (err) {
+    log.error("subscription_status_error", { message: err.message });
+    return res.status(500).json({ error: "Failed to retrieve subscription status." });
+  }
 });
 
 

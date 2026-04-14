@@ -1,7 +1,7 @@
 {
   "name": "glauc-gateway",
-  "version": "1.1.0",
-  "description": "Glauc Node.js API Gateway — auth, OAuth, rate limiting, image preprocessing",
+  "version": "1.3.0",
+  "description": "Glauc Node.js API Gateway — auth, OAuth, Stripe subscriptions, rate limiting, image preprocessing",
   "type": "module",
   "main": "server.js",
   "scripts": {
@@ -9,17 +9,18 @@
     "dev":   "node --watch server.js"
   },
   "dependencies": {
-    "bcryptjs":       "^2.4.3",
-    "better-sqlite3": "^9.4.3",
-    "dotenv":         "^16.4.5",
-    "express":        "^5.0.1",
+    "bcryptjs":           "^2.4.3",
+    "better-sqlite3":     "^9.4.3",
+    "dotenv":             "^16.4.5",
+    "express":            "^5.0.1",
     "express-rate-limit": "^7.2.0",
-    "form-data":      "^4.0.0",
-    "helmet":         "^7.1.0",
-    "jose":           "^5.2.3",
-    "multer":         "^1.4.5-lts.1",
-    "node-fetch":     "^3.3.2",
-    "sharp":          "^0.33.3"
+    "form-data":          "^4.0.0",
+    "helmet":             "^7.1.0",
+    "jose":               "^5.2.3",
+    "multer":             "^1.4.5-lts.1",
+    "node-fetch":         "^3.3.2",
+    "sharp":              "^0.33.3",
+    "stripe":             "^16.0.0"
   },
   "engines": {
     "node": ">=20.0.0"

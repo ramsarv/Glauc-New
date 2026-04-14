@@ -1,31 +1,23 @@
 /**
- * Glauc API Service
- * Central client for all network requests.
- * Handles auth headers, timeouts, session expiry, and form-data uploads.
+ * Glauc API Service v2 — typed client for all endpoints.
+ * Handles auth headers, timeouts, 401 session expiry, and Stripe payment flow.
  */
 
 import * as SecureStore from 'expo-secure-store';
 
-export const API_URL =
-  process.env.EXPO_PUBLIC_API_URL || 'http://localhost:3000';
+export const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://localhost:3000';
 
-const TOKEN_KEY = 'glauc_auth_token';
+const TOKEN_KEY       = 'glauc_auth_token';
 const DEFAULT_TIMEOUT = 30_000;
 const SCAN_TIMEOUT    = 90_000;
 
-// ── Token management (SecureStore — encrypted on device) ──────
+// ── Token management ──────────────────────────────────────────
 export async function getToken() {
-  try {
-    return await SecureStore.getItemAsync(TOKEN_KEY);
-  } catch {
-    return null;
-  }
+  try { return await SecureStore.getItemAsync(TOKEN_KEY); } catch { return null; }
 }
-
 export async function saveToken(token) {
   await SecureStore.setItemAsync(TOKEN_KEY, token);
 }
-
 export async function clearToken() {
   await SecureStore.deleteItemAsync(TOKEN_KEY);
 }
@@ -43,11 +35,7 @@ async function request(path, options = {}, timeoutMs = DEFAULT_TIMEOUT) {
   const timer      = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const res = await fetch(`${API_URL}${path}`, {
-      ...options,
-      headers,
-      signal: controller.signal,
-    });
+    const res = await fetch(`${API_URL}${path}`, { ...options, headers, signal: controller.signal });
     clearTimeout(timer);
 
     if (res.status === 401) {
@@ -61,76 +49,40 @@ async function request(path, options = {}, timeoutMs = DEFAULT_TIMEOUT) {
     return res.json();
   } catch (err) {
     clearTimeout(timer);
-    if (err.name === 'AbortError') {
-      throw new Error('Request timed out. Please try again.');
-    }
+    if (err.name === 'AbortError') throw new Error('Request timed out. Please try again.');
     throw err;
   }
 }
 
-// ── Auth endpoints ────────────────────────────────────────────
-export async function apiLogin(email, password) {
-  return request('/auth/login', {
-    method: 'POST',
-    body: JSON.stringify({ email: email.trim().toLowerCase(), password }),
-  });
-}
+// ── Auth ──────────────────────────────────────────────────────
+export const apiLogin        = (email, password)   => request('/auth/login',   { method: 'POST', body: JSON.stringify({ email: email.trim().toLowerCase(), password }) });
+export const apiRegister     = (email, password, name) => request('/auth/register', { method: 'POST', body: JSON.stringify({ email: email.trim().toLowerCase(), password, name }) });
+export const apiLoginGoogle  = (idToken)           => request('/auth/google',  { method: 'POST', body: JSON.stringify({ id_token: idToken }) });
+export const apiLoginApple   = (identityToken, name) => request('/auth/apple', { method: 'POST', body: JSON.stringify({ identity_token: identityToken, name }) });
+export const apiGetMe        = ()                  => request('/auth/me');
 
-export async function apiRegister(email, password, name) {
-  return request('/auth/register', {
-    method: 'POST',
-    body: JSON.stringify({ email: email.trim().toLowerCase(), password, name }),
-  });
-}
-
-export async function apiLoginGoogle(idToken) {
-  return request('/auth/google', {
-    method: 'POST',
-    body: JSON.stringify({ id_token: idToken }),
-  });
-}
-
-export async function apiLoginApple(identityToken, name) {
-  return request('/auth/apple', {
-    method: 'POST',
-    body: JSON.stringify({ identity_token: identityToken, name }),
-  });
-}
-
-export async function apiGetMe() {
-  return request('/auth/me');
-}
-
-// ── Scan endpoint (multipart form-data) ───────────────────────
+// ── Scan ──────────────────────────────────────────────────────
 export async function apiScan(imageUri, metadata) {
   const token = await getToken();
-
-  const formData = new FormData();
-  formData.append('file', {
-    uri:  imageUri,
-    type: 'image/jpeg',
-    name: 'eye.jpg',
-  });
-  formData.append('gender', metadata.gender);
-  formData.append('race',   metadata.race);
-  formData.append('age',    String(parseInt(metadata.age)));
+  const form  = new FormData();
+  form.append('file',   { uri: imageUri, type: 'image/jpeg', name: 'eye.jpg' });
+  form.append('gender', metadata.gender);
+  form.append('race',   metadata.race);
+  form.append('age',    String(parseInt(metadata.age)));
 
   const controller = new AbortController();
   const timer      = setTimeout(() => controller.abort(), SCAN_TIMEOUT);
 
   try {
     const res = await fetch(`${API_URL}/scan`, {
-      method:  'POST',
+      method: 'POST',
       headers: token ? { Authorization: `Bearer ${token}` } : {},
-      body:    formData,
+      body:    form,
       signal:  controller.signal,
     });
     clearTimeout(timer);
 
-    if (res.status === 401) {
-      await clearToken();
-      throw new Error('SESSION_EXPIRED');
-    }
+    if (res.status === 401) { await clearToken(); throw new Error('SESSION_EXPIRED'); }
     if (res.status === 422) {
       const body = await res.json().catch(() => ({}));
       throw new Error(body.reason || 'Image quality check failed. Please retake.');
@@ -142,31 +94,46 @@ export async function apiScan(imageUri, metadata) {
     return res.json();
   } catch (err) {
     clearTimeout(timer);
-    if (err.name === 'AbortError') {
-      throw new Error('Scan timed out. Please check your connection and try again.');
-    }
+    if (err.name === 'AbortError') throw new Error('Scan timed out. Please check your connection.');
     throw err;
   }
 }
 
 // ── Explanation polling ───────────────────────────────────────
-export async function apiGetExplanation(jobId) {
-  return request(`/scan/explain/${encodeURIComponent(jobId)}`);
-}
+export const apiGetExplanation = (jobId) => request(`/scan/explain/${encodeURIComponent(jobId)}`);
 
 // ── History & trend ───────────────────────────────────────────
-export async function apiGetHistory(page = 0) {
-  return request(`/history?page=${page}`);
-}
-
-export async function apiGetTrend() {
-  return request('/trend');
-}
+export const apiGetHistory = (page = 0) => request(`/history?page=${page}`);
+export const apiGetTrend   = ()         => request('/trend');
 
 // ── Reminders ─────────────────────────────────────────────────
-export async function apiSetReminder(enabled) {
-  return request('/reminder', {
+export const apiSetReminder = (enabled) => request('/reminder', { method: 'POST', body: JSON.stringify({ enabled }) });
+
+// ── Subscription / Stripe ─────────────────────────────────────
+
+/**
+ * Create a Stripe PaymentIntent for the given plan.
+ * Returns { clientSecret, paymentIntentId }
+ */
+export const apiCreatePaymentIntent = (planId) =>
+  request('/subscription/create-payment-intent', {
     method: 'POST',
-    body: JSON.stringify({ enabled }),
+    body:   JSON.stringify({ plan_id: planId }),
   });
-}
+
+/**
+ * Activate subscription after successful payment.
+ * Server verifies payment intent status with Stripe before activating.
+ */
+export const apiActivateSubscription = (paymentIntentId, planId) =>
+  request('/subscription/activate', {
+    method: 'POST',
+    body:   JSON.stringify({ payment_intent_id: paymentIntentId, plan_id: planId }),
+  });
+
+/**
+ * Get current subscription status and billing portal URL.
+ * Returns { status, plan, currentPeriodEnd, portalUrl } or null
+ */
+export const apiGetSubscription = () =>
+  request('/subscription/status').catch(() => null);

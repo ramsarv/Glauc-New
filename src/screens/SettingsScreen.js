@@ -2,7 +2,7 @@
  * SettingsScreen — Full account, subscription, notifications, privacy, support.
  */
 
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import {
   View, Text, TouchableOpacity, StyleSheet, ScrollView,
   Switch, Alert, ActivityIndicator, Linking,
@@ -12,15 +12,30 @@ import { LinearGradient } from 'expo-linear-gradient';
 import * as Notifications from 'expo-notifications';
 import * as Device from 'expo-device';
 import Constants from 'expo-constants';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { T, PLANS } from '../constants/theme';
 import { useAuth } from '../context/AuthContext';
 import { apiSetReminder, apiGetSubscription } from '../services/api';
+import { CONSENT_KEY } from './ConsentScreen';
 
 export default function SettingsScreen({ navigation }) {
   const { user, signOut } = useAuth();
-  const [reminder,  setReminder]  = useState(user?.reminder_enabled ?? true);
-  const [toggling,  setToggling]  = useState(false);
+  const [reminder,   setReminder]   = useState(user?.reminder_enabled ?? true);
+  const [toggling,   setToggling]   = useState(false);
   const [loadingSub, setLoadingSub] = useState(false);
+  const [aiConsent,  setAiConsent]  = useState(false);
+  const [togglingAI, setTogglingAI] = useState(false);
+
+  // Load current AI training consent from stored record
+  useEffect(() => {
+    AsyncStorage.getItem(CONSENT_KEY).then(raw => {
+      if (!raw) return;
+      try {
+        const record = JSON.parse(raw);
+        setAiConsent(!!record.aiTrainingConsent);
+      } catch {}
+    }).catch(() => {});
+  }, []);
 
   const handleReminderToggle = useCallback(async (value) => {
     setToggling(true);
@@ -60,6 +75,24 @@ export default function SettingsScreen({ navigation }) {
       { text: 'Sign Out', style: 'destructive', onPress: signOut },
     ]);
   }, [signOut]);
+
+  const handleAIConsentToggle = useCallback(async (value) => {
+    setTogglingAI(true);
+    try {
+      const raw    = await AsyncStorage.getItem(CONSENT_KEY).catch(() => null);
+      const record = raw ? JSON.parse(raw) : {};
+      await AsyncStorage.setItem(CONSENT_KEY, JSON.stringify({
+        ...record,
+        aiTrainingConsent: value,
+        aiConsentUpdatedAt: new Date().toISOString(),
+      }));
+      setAiConsent(value);
+    } catch {
+      Alert.alert('Error', 'Could not update setting. Please try again.');
+    } finally {
+      setTogglingAI(false);
+    }
+  }, []);
 
   const handleDeleteAccount = useCallback(() => {
     Alert.alert(
@@ -137,13 +170,20 @@ export default function SettingsScreen({ navigation }) {
 
         {/* Privacy */}
         <Section title="Privacy & Data">
+          <SwitchRow
+            label="AI Training Consent"
+            sub="Allow de-identified scan data to improve Glauc's AI models"
+            value={aiConsent}
+            onValueChange={handleAIConsentToggle}
+            loading={togglingAI}
+          />
           <ActionRow
             label="Privacy Policy"
-            onPress={() => Linking.openURL('https://glauc.app/privacy').catch(() => {})}
+            onPress={() => navigation.navigate('PrivacyPolicy')}
           />
           <ActionRow
             label="Terms of Service"
-            onPress={() => Linking.openURL('https://glauc.app/terms').catch(() => {})}
+            onPress={() => navigation.navigate('Terms')}
           />
           <ActionRow
             label="Export My Data"

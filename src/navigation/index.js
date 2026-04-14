@@ -31,20 +31,33 @@ import { T } from '../constants/theme';
 import { useAuth } from '../context/AuthContext';
 import { apiGetSubscription } from '../services/api';
 
-import AuthScreen         from '../screens/AuthScreen';
-import OnboardingScreen   from '../screens/OnboardingScreen';
-import SubscriptionScreen from '../screens/SubscriptionScreen';
-import ScanScreen         from '../screens/ScanScreen';
-import ProcessingScreen   from '../screens/ProcessingScreen';
-import ResultsScreen      from '../screens/ResultsScreen';
-import HistoryScreen      from '../screens/HistoryScreen';
-import ProfileScreen      from '../screens/ProfileScreen';
-import SettingsScreen     from '../screens/SettingsScreen';
+import AuthScreen          from '../screens/AuthScreen';
+import OnboardingScreen    from '../screens/OnboardingScreen';
+import ConsentScreen, { CONSENT_KEY } from '../screens/ConsentScreen';
+import SubscriptionScreen  from '../screens/SubscriptionScreen';
+import ScanScreen          from '../screens/ScanScreen';
+import ProcessingScreen    from '../screens/ProcessingScreen';
+import ResultsScreen       from '../screens/ResultsScreen';
+import HistoryScreen       from '../screens/HistoryScreen';
+import ProfileScreen       from '../screens/ProfileScreen';
+import SettingsScreen      from '../screens/SettingsScreen';
+import PrivacyPolicyScreen from '../screens/PrivacyPolicyScreen';
+import TermsScreen         from '../screens/TermsScreen';
 
 const Stack = createNativeStackNavigator();
 const Tab   = createBottomTabNavigator();
 
 const ONBOARDING_KEY = 'glauc_onboarding_v2';
+
+// Deep-link config — handles the glauc:// redirect URI from OAuth providers
+const linking = {
+  prefixes: ['glauc://', 'https://glauc.app'],
+  config: {
+    screens: {
+      Auth: 'auth',
+    },
+  },
+};
 
 // ── Main tab navigator ────────────────────────────────────────
 function MainTabs() {
@@ -142,14 +155,22 @@ export default function RootNavigator() {
   const { user, loading } = useAuth();
 
   const [onboardingDone, setOnboardingDone] = useState(null);
+  const [consentDone,    setConsentDone]    = useState(null);
   const [subscription,   setSubscription]   = useState(null);
   const [subChecked,     setSubChecked]     = useState(false);
 
-  // Check first-launch flag
+  // Check first-launch and consent flags in parallel
   useEffect(() => {
-    AsyncStorage.getItem(ONBOARDING_KEY).then(val => {
-      setOnboardingDone(val === '1');
-    }).catch(() => setOnboardingDone(true));
+    Promise.all([
+      AsyncStorage.getItem(ONBOARDING_KEY).catch(() => null),
+      AsyncStorage.getItem(CONSENT_KEY).catch(() => null),
+    ]).then(([ob, cs]) => {
+      setOnboardingDone(ob === '1');
+      setConsentDone(!!cs);
+    }).catch(() => {
+      setOnboardingDone(true);
+      setConsentDone(false);
+    });
   }, []);
 
   // Check subscription when user is known
@@ -165,47 +186,79 @@ export default function RootNavigator() {
     setOnboardingDone(true);
   }, []);
 
+  const finishConsent = useCallback(() => {
+    setConsentDone(true);
+  }, []);
+
   const handleAuthSuccess = useCallback(async (_authUser, isNewUser) => {
     if (isNewUser) {
-      await AsyncStorage.removeItem(ONBOARDING_KEY).catch(() => {});
+      await Promise.all([
+        AsyncStorage.removeItem(ONBOARDING_KEY).catch(() => {}),
+        AsyncStorage.removeItem(CONSENT_KEY).catch(() => {}),
+      ]);
       setOnboardingDone(false);
+      setConsentDone(false);
     }
   }, []);
 
   const hasActiveSubscription = subscription?.status === 'active' || subscription?.status === 'trialing';
 
-  // Wait for all checks
-  if (loading || onboardingDone === null || !subChecked) return null;
+  // Wait for all async checks to complete
+  if (loading || onboardingDone === null || consentDone === null || !subChecked) return null;
 
   return (
-    <NavigationContainer>
+    <NavigationContainer linking={linking}>
       <Stack.Navigator screenOptions={{ headerShown: false, animation: 'fade' }}>
         {!user ? (
-          /* ── No session ─────────────────────────────── */
-          <Stack.Screen name="Auth">
-            {(props) => <AuthScreen {...props} onSuccess={handleAuthSuccess} />}
-          </Stack.Screen>
+          /* ── No session — show legal docs before auth so users can read them ── */
+          <>
+            <Stack.Screen name="Auth">
+              {(props) => <AuthScreen {...props} onSuccess={handleAuthSuccess} />}
+            </Stack.Screen>
+            <Stack.Screen name="PrivacyPolicy" component={PrivacyPolicyScreen} options={{ animation: 'slide_from_right' }} />
+            <Stack.Screen name="Terms"         component={TermsScreen}         options={{ animation: 'slide_from_right' }} />
+          </>
 
         ) : !onboardingDone ? (
           /* ── New user onboarding ─────────────────────── */
-          <Stack.Screen name="Onboarding">
-            {(props) => <OnboardingScreen {...props} onDone={finishOnboarding} />}
-          </Stack.Screen>
+          <>
+            <Stack.Screen name="Onboarding">
+              {(props) => <OnboardingScreen {...props} onDone={finishOnboarding} />}
+            </Stack.Screen>
+            <Stack.Screen name="PrivacyPolicy" component={PrivacyPolicyScreen} options={{ animation: 'slide_from_right' }} />
+            <Stack.Screen name="Terms"         component={TermsScreen}         options={{ animation: 'slide_from_right' }} />
+          </>
+
+        ) : !consentDone ? (
+          /* ── Biometric consent (BIPA required) ───────── */
+          <>
+            <Stack.Screen name="Consent">
+              {(props) => <ConsentScreen {...props} onDone={finishConsent} />}
+            </Stack.Screen>
+            <Stack.Screen name="PrivacyPolicy" component={PrivacyPolicyScreen} options={{ animation: 'slide_from_right' }} />
+            <Stack.Screen name="Terms"         component={TermsScreen}         options={{ animation: 'slide_from_right' }} />
+          </>
 
         ) : !hasActiveSubscription ? (
           /* ── Paywall ─────────────────────────────────── */
-          <Stack.Screen
-            name="Subscription"
-            component={SubscriptionScreen}
-            options={{ animation: 'slide_from_bottom' }}
-          />
+          <>
+            <Stack.Screen
+              name="Subscription"
+              component={SubscriptionScreen}
+              options={{ animation: 'slide_from_bottom' }}
+            />
+            <Stack.Screen name="PrivacyPolicy" component={PrivacyPolicyScreen} options={{ animation: 'slide_from_right' }} />
+            <Stack.Screen name="Terms"         component={TermsScreen}         options={{ animation: 'slide_from_right' }} />
+          </>
 
         ) : (
-          /* ── Authenticated + subscribed ──────────────── */
+          /* ── Authenticated + consented + subscribed ──── */
           <>
-            <Stack.Screen name="MainTabs"    component={MainTabs} />
-            <Stack.Screen name="Settings"    component={SettingsScreen} options={{ animation: 'slide_from_right' }} />
+            <Stack.Screen name="MainTabs"     component={MainTabs} />
+            <Stack.Screen name="Settings"     component={SettingsScreen}     options={{ animation: 'slide_from_right' }} />
             <Stack.Screen name="Subscription" component={SubscriptionScreen} options={{ animation: 'slide_from_bottom' }} />
+            <Stack.Screen name="PrivacyPolicy" component={PrivacyPolicyScreen} options={{ animation: 'slide_from_right' }} />
+            <Stack.Screen name="Terms"         component={TermsScreen}         options={{ animation: 'slide_from_right' }} />
             <Stack.Screen
               name="Processing"
               component={ProcessingScreen}

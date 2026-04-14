@@ -19,6 +19,7 @@ import {
   apiLoginGoogle,
   apiLoginApple,
   apiGetMe,
+  registerSessionExpiredCallback,
 } from '../services/api';
 
 const AuthContext = createContext(null);
@@ -26,6 +27,11 @@ const AuthContext = createContext(null);
 export function AuthProvider({ children }) {
   const [user,    setUser]    = useState(null);
   const [loading, setLoading] = useState(true); // true on first boot
+
+  // Register a callback so any 401 from any screen auto-signs out
+  useEffect(() => {
+    registerSessionExpiredCallback(() => setUser(null));
+  }, []);
 
   // On mount: restore session from SecureStore
   useEffect(() => {

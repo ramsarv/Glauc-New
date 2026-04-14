@@ -105,10 +105,10 @@ export default function ProfileScreen({ navigation }) {
         {/* Quick links */}
         <Card style={s.sec}>
           <Text style={s.secTitle}>Account</Text>
-          <ActionRow label="Settings"          onPress={() => navigation.navigate('Settings')} />
+          <ActionRow label="Settings"            onPress={() => navigation.navigate('Settings')} />
           <ActionRow label="Manage Subscription" onPress={() => navigation.navigate('Subscription')} />
-          <ActionRow label="Privacy Policy"    onPress={() => {}} />
-          <ActionRow label="Terms of Service"  onPress={() => {}} />
+          <ActionRow label="Privacy Policy"      onPress={() => navigation.navigate('PrivacyPolicy')} />
+          <ActionRow label="Terms of Service"    onPress={() => navigation.navigate('Terms')} />
         </Card>
 
         <Text style={s.disclaimer}>

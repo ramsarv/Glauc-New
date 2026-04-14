@@ -11,6 +11,15 @@ const TOKEN_KEY       = 'glauc_auth_token';
 const DEFAULT_TIMEOUT = 30_000;
 const SCAN_TIMEOUT    = 90_000;
 
+// ── Session expiry callback ───────────────────────────────────
+// AuthContext registers this so it can sign the user out globally
+// when any API call returns 401, without every screen needing to
+// handle that error individually.
+let _onSessionExpired = null;
+export function registerSessionExpiredCallback(cb) {
+  _onSessionExpired = cb;
+}
+
 // ── Token management ──────────────────────────────────────────
 export async function getToken() {
   try { return await SecureStore.getItemAsync(TOKEN_KEY); } catch { return null; }
@@ -40,16 +49,19 @@ async function request(path, options = {}, timeoutMs = DEFAULT_TIMEOUT) {
 
     if (res.status === 401) {
       await clearToken();
-      throw new Error('SESSION_EXPIRED');
+      _onSessionExpired?.();
+      throw new Error('Your session has expired. Please sign in again.');
     }
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
-      throw new Error(body.error || `Request failed (${res.status})`);
+      throw new Error(body.error || `Request failed (${res.status}). Please try again.`);
     }
     return res.json();
   } catch (err) {
     clearTimeout(timer);
-    if (err.name === 'AbortError') throw new Error('Request timed out. Please try again.');
+    if (err.name === 'AbortError') {
+      throw new Error('Request timed out. Check your connection and try again.');
+    }
     throw err;
   }
 }
@@ -82,7 +94,11 @@ export async function apiScan(imageUri, metadata) {
     });
     clearTimeout(timer);
 
-    if (res.status === 401) { await clearToken(); throw new Error('SESSION_EXPIRED'); }
+    if (res.status === 401) {
+      await clearToken();
+      _onSessionExpired?.();
+      throw new Error('Your session has expired. Please sign in again.');
+    }
     if (res.status === 422) {
       const body = await res.json().catch(() => ({}));
       throw new Error(body.reason || 'Image quality check failed. Please retake.');
@@ -94,7 +110,7 @@ export async function apiScan(imageUri, metadata) {
     return res.json();
   } catch (err) {
     clearTimeout(timer);
-    if (err.name === 'AbortError') throw new Error('Scan timed out. Please check your connection.');
+    if (err.name === 'AbortError') throw new Error('Scan timed out. Check your connection and try again.');
     throw err;
   }
 }

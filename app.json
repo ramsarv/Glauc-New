@@ -16,6 +16,7 @@
     "ios": {
       "supportsTablet": false,
       "bundleIdentifier": "com.glauc.app",
+      "usesAppleSignIn": true,
       "infoPlist": {
         "NSCameraUsageDescription": "Glauc needs camera access to capture your eye image for ocular age analysis.",
         "NSPhotoLibraryUsageDescription": "Glauc needs photo library access to select eye images for analysis.",
@@ -61,8 +62,7 @@
         "expo-notifications",
         {
           "icon": "./assets/notification-icon.png",
-          "color": "#C8922A",
-          "sounds": []
+          "color": "#789D7F"
         }
       ],
       "expo-secure-store",
@@ -75,6 +75,12 @@
         }
       ]
     ],
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/your-eas-project-id"
+    },
     "extra": {
       "eas": {
         "projectId": "324a6816-3a00-4b9e-a747-6fe9c7b2f39f"

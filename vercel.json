@@ -1,6 +1,5 @@
 {
   "version": 2,
-  "comment": "Deploys the Node.js API gateway only. Python ML backend runs on a separate GPU server.",
   "functions": {
     "server/server.js": {
       "maxDuration": 60

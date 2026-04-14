@@ -1,24 +1,18 @@
 {
   "version": 2,
   "comment": "Deploys the Node.js API gateway only. Python ML backend runs on a separate GPU server.",
-  "builds": [
-    {
-      "src": "server/server.js",
-      "use": "@vercel/node"
-    }
-  ],
-  "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "/server/server.js"
-    }
-  ],
-  "env": {
-    "NODE_ENV": "production"
-  },
   "functions": {
     "server/server.js": {
       "maxDuration": 60
     }
+  },
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/server/server.js"
+    }
+  ],
+  "env": {
+    "NODE_ENV": "production"
   }
 }

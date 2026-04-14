@@ -106,7 +106,14 @@ const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,253}\.[^\s@]{2,}$/;
 
 
 // ── DATABASE ──────────────────────────────────────────────────
-const db = new Database(path.join(__dirname, "glauc_users.db"));
+// Vercel serverless: only /tmp is writable. Use it in production so the DB
+// file can be created. Note: /tmp is ephemeral between cold starts — for
+// persistent storage in production, replace with Turso/Neon/PlanetScale.
+const DB_PATH = NODE_ENV === "production"
+  ? path.join("/tmp", "glauc_users.db")
+  : path.join(__dirname, "glauc_users.db");
+
+const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
 
 db.exec(`
@@ -853,18 +860,24 @@ app.use((err, req, res, _next) => {
 });
 
 
-// ── START ─────────────────────────────────────────────────────
-if (NODE_ENV === "production" && !process.env.HTTPS_PROXY && !process.env.FORCE_HTTP) {
-  log.warn("https_check", {
-    message: "Running in production — ensure a TLS-terminating reverse proxy is in front.",
+// ── EXPORT (Vercel / serverless) ──────────────────────────────
+// @vercel/node requires the Express app to be the default export.
+// The listen() call below is skipped when running inside Vercel.
+export default app;
+
+// ── START (standalone / local / Railway / Render) ─────────────
+if (!process.env.VERCEL) {
+  if (NODE_ENV === "production" && !process.env.HTTPS_PROXY && !process.env.FORCE_HTTP) {
+    log.warn("https_check", {
+      message: "Running in production — ensure a TLS-terminating reverse proxy is in front.",
+    });
+  }
+  app.listen(PORT, () => {
+    log.info("gateway_started", {
+      port: PORT, env: NODE_ENV,
+      googleOAuth: GOOGLE_CLIENT_IDS.length > 0,
+      appleOAuth:  true,
+      gatewayAuth: !!GATEWAY_SECRET,
+    });
   });
 }
-
-app.listen(PORT, () => {
-  log.info("gateway_started", {
-    port: PORT, env: NODE_ENV,
-    googleOAuth: GOOGLE_CLIENT_IDS.length > 0,
-    appleOAuth:  true,
-    gatewayAuth: !!GATEWAY_SECRET,
-  });
-});

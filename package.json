@@ -48,7 +48,20 @@
 
     "@react-native-async-storage/async-storage": "1.23.1",
 
-    "@stripe/stripe-react-native": "0.38.0"
+    "@stripe/stripe-react-native": "0.38.0",
+
+    "@libsql/client":     "^0.14.0",
+    "bcryptjs":           "^2.4.3",
+    "dotenv":             "^16.4.5",
+    "express":            "^5.0.1",
+    "express-rate-limit": "^7.2.0",
+    "form-data":          "^4.0.0",
+    "helmet":             "^7.1.0",
+    "jose":               "^5.2.3",
+    "multer":             "^1.4.5-lts.1",
+    "node-fetch":         "^3.3.2",
+    "sharp":              "^0.33.3",
+    "stripe":             "^16.0.0"
   },
   "devDependencies": {
     "@babel/core":       "^7.24.0",

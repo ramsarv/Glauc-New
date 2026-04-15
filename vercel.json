@@ -1,7 +1,6 @@
 {
   "version": 2,
-  "installCommand": "npm install && cd server && npm install",
-  "rewrites": [
+"rewrites": [
     {
       "source": "/(.*)",
       "destination": "/api/index"

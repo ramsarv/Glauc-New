@@ -21,14 +21,14 @@
         "simulator": false
       },
       "env": {
-        "EXPO_PUBLIC_API_URL": "https://your-staging-gateway.vercel.app",
+        "EXPO_PUBLIC_API_URL": "https://glauc-new-v14.vercel.app",
         "EAS_BUILD_NO_EXPO_GO_WARNING": "true"
       }
     },
     "production": {
       "autoIncrement": true,
       "env": {
-        "EXPO_PUBLIC_API_URL": "https://your-gateway.vercel.app",
+        "EXPO_PUBLIC_API_URL": "https://glauc-new-v14.vercel.app",
         "EAS_BUILD_NO_EXPO_GO_WARNING": "true"
       }
     }

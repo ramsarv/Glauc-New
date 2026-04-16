@@ -30,7 +30,8 @@ import {
 import { AuthProvider } from './src/context/AuthContext';
 import { T }           from './src/constants/theme';
 
-// Load the navigator with error capture so any import failure is visible on screen
+// Load the navigator via require() so any module-load failure is catchable.
+// Static `import` is hoisted and silently kills AppRegistry if one module fails.
 let RootNavigator;
 let _loadError = null;
 try {
@@ -39,10 +40,8 @@ try {
   _loadError = e.message + '\n\n' + (e.stack || '').slice(0, 1200);
   console.error('[Glauc] FATAL module load error:\n', _loadError);
   RootNavigator = () => (
-    <View style={{ flex: 1, backgroundColor: '#000', justifyContent: 'center', padding: 24 }}>
-      <Text style={{ color: '#ff5555', fontSize: 12, fontFamily: 'monospace', lineHeight: 18 }}>
-        {'MODULE LOAD ERROR\n\n' + _loadError}
-      </Text>
+    <View style={s.errorContainer}>
+      <Text style={s.errorText}>{'MODULE LOAD ERROR\n\n' + _loadError}</Text>
     </View>
   );
 }
@@ -59,6 +58,13 @@ try {
 } catch {
   StripeProvider = null;
 }
+
+// StyleSheet MUST be declared before App() so Hermes doesn't hit the TDZ
+const s = StyleSheet.create({
+  flex:           { flex: 1, backgroundColor: T.bgDeep },
+  errorContainer: { flex: 1, backgroundColor: '#000', justifyContent: 'center', padding: 24 },
+  errorText:      { color: '#ff5555', fontSize: 12, fontFamily: 'monospace', lineHeight: 18 },
+});
 
 function App() {
   const [fontsLoaded, fontError] = useFonts({
@@ -106,6 +112,7 @@ function App() {
   return tree;
 }
 
-// Explicit registration — required in Expo 51 when "main" points to App.js directly.
-// babel-preset-expo auto-registration is not reliable with complex import trees.
+// Explicit registration works in both Expo Go and development builds.
+// Without this, "main has not been registered" occurs when Expo's Babel
+// transform doesn't auto-inject registerRootComponent for this entry setup.
 registerRootComponent(App);

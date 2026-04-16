@@ -8,7 +8,7 @@
  */
 
 import React, { useCallback } from 'react';
-import { View, StyleSheet } from 'react-native';
+import { View, StyleSheet, Text } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import * as SplashScreen from 'expo-splash-screen';
@@ -27,8 +27,25 @@ import {
 } from '@expo-google-fonts/dm-sans';
 
 import { AuthProvider } from './src/context/AuthContext';
-import RootNavigator   from './src/navigation/index';
 import { T }           from './src/constants/theme';
+
+// Load the navigator via require() so any module-load failure is catchable.
+// Static `import` is hoisted and silently kills AppRegistry if one module fails.
+let RootNavigator;
+let _loadError = null;
+try {
+  RootNavigator = require('./src/navigation/index').default;
+} catch (e) {
+  _loadError = e.message + '\n\n' + (e.stack || '').slice(0, 1200);
+  console.error('[Glauc] FATAL module load error:\n', _loadError);
+  RootNavigator = () => (
+    <View style={{ flex: 1, backgroundColor: '#000', justifyContent: 'center', padding: 24 }}>
+      <Text style={{ color: '#ff5555', fontSize: 12, fontFamily: 'monospace', lineHeight: 18 }}>
+        {'MODULE LOAD ERROR\n\n' + _loadError}
+      </Text>
+    </View>
+  );
+}
 
 // Keep splash visible until fonts resolve
 SplashScreen.preventAutoHideAsync();

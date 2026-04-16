@@ -13,13 +13,10 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as WebBrowser from 'expo-web-browser';
-import * as Google from 'expo-auth-session/providers/google';
 import * as AppleAuthentication from 'expo-apple-authentication';
 import Svg, { Circle, Line, Path } from 'react-native-svg';
 import { T } from '../constants/theme';
 import { useAuth } from '../context/AuthContext';
-
-WebBrowser.maybeCompleteAuthSession();
 
 // ── Inline SVG icons ──────────────────────────────────────────
 function GoogleIcon({ size = 20 }) {
@@ -86,35 +83,12 @@ export default function AuthScreen({ onSuccess }) {
   }, [showEmail]);
 
   // ── Google OAuth ───────────────────────────────────────────
-  // useAuthRequest must always receive an object (passing null causes it to
-  // crash reading .iosClientId). Use placeholder strings when not configured
-  // so the hook initialises safely — the button is disabled so it never fires.
-  const googleConfigured = !!(
-    process.env.EXPO_PUBLIC_GOOGLE_ANDROID_CLIENT_ID ||
-    process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID
-  );
-  const [, response, promptGoogleAsync] = Google.useAuthRequest({
-    clientId:        process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID        || 'not-configured',
-    iosClientId:     process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID    || 'not-configured',
-    androidClientId: process.env.EXPO_PUBLIC_GOOGLE_ANDROID_CLIENT_ID || 'not-configured',
-    scopes: ['openid', 'profile', 'email'],
-  });
-
-  useEffect(() => {
-    if (response?.type === 'success') {
-      const { id_token } = response.params;
-      if (id_token) handleGoogleToken(id_token);
-    }
-  }, [response]);
-
-  const handleGoogleToken = useCallback(async (idToken) => {
-    setLoading(true); setError(null);
-    try {
-      const result = await loginWithGoogle(idToken);
-      onSuccess(result.user, result.isNewUser);
-    } catch (err) { setError(err.message); }
-    finally { setLoading(false); }
-  }, [loginWithGoogle, onSuccess]);
+  // Google Sign-In requires EXPO_PUBLIC_GOOGLE_ANDROID_CLIENT_ID to be set.
+  // The expo-auth-session hook crashes in Expo Go without real credentials,
+  // so we skip the hook entirely and show the button as disabled until
+  // Google OAuth credentials are configured in eas.json / app.config.
+  const googleConfigured = false; // set true once Google client IDs are added
+  const promptGoogleAsync = null;
 
   const handleApple = useCallback(async () => {
     setError(null);

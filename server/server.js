@@ -1,28 +1,16 @@
 /**
- * glauc-gateway/server.js  v1.3
+ * glauc-gateway/server.js  v1.4
  * ══════════════════════════════════════════════════════════════
- * Production-hardened Node.js API Gateway.
- *
- * v1.3 additions:
- *   • Stripe subscription system (PaymentIntents + webhook)
- *   • subscriptions table — plan, status, period tracking
- *   • POST /subscription/create-payment-intent
- *   • POST /subscription/activate
- *   • GET  /subscription/status
- *   • POST /webhook/stripe (raw body, signature verified)
- *
- * v1.2 additions:
- *   • POST /auth/google — verifies Google ID token via tokeninfo endpoint
- *   • POST /auth/apple  — verifies Apple identity token via JWKS (jose)
- *   • oauth_accounts table for provider ↔ user mapping
- *   • GOOGLE_CLIENT_ID / APPLE_BUNDLE_ID audience checks
+ * v1.4: replaced better-sqlite3 (native C++ addon, incompatible with
+ *       Vercel Lambda) with @libsql/client (pure WASM/JS).
+ *       All DB calls are now async. Top-level await initialises schema.
  */
 
 import "dotenv/config";
 import express        from "express";
 import multer         from "multer";
 import sharp          from "sharp";
-import Database       from "better-sqlite3";
+import { createClient } from "@libsql/client";
 import { SignJWT, jwtVerify, importJWK } from "jose";
 import fetch          from "node-fetch";
 import FormData       from "form-data";
@@ -43,7 +31,6 @@ const MAX_SCANS_DAY  = parseInt(process.env.MAX_SCANS_DAY || "10");
 const MAX_FILE_MB    = 15;
 const NODE_ENV       = process.env.NODE_ENV || "development";
 
-// Fail hard if JWT_SECRET not set
 if (!process.env.JWT_SECRET) {
   console.error(JSON.stringify({ level: "fatal", msg: "JWT_SECRET env var is required. Exiting." }));
   process.exit(1);
@@ -56,7 +43,6 @@ if (!GATEWAY_SECRET) {
   console.warn(JSON.stringify({ level: "warn", msg: "GATEWAY_SECRET not set — Python API has no gateway auth." }));
 }
 
-// OAuth config
 const GOOGLE_CLIENT_IDS = [
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_IOS_CLIENT_ID,
@@ -65,7 +51,6 @@ const GOOGLE_CLIENT_IDS = [
 
 const APPLE_BUNDLE_ID = process.env.APPLE_BUNDLE_ID || "com.glauc.app";
 
-// CORS whitelist
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || "")
   .split(",").map(s => s.trim()).filter(Boolean);
 
@@ -78,19 +63,17 @@ const stripe = process.env.STRIPE_SECRET_KEY
 
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
 
-// Plan amounts in cents (USD). Matches PLANS in theme.js.
 const PLAN_AMOUNTS = {
-  single_once:            1900,   // $19 — one-time
-  comprehensive_once:     2900,   // $29 — one-time
-  single_weekly:          2400,   // $24/mo (≈ $6/week × 4)
-  comprehensive_weekly:   3600,   // $36/mo (≈ $9/week × 4)
+  single_once:            1900,
+  comprehensive_once:     2900,
+  single_weekly:          2400,
+  comprehensive_weekly:   3600,
 };
 
-// Period (days) to grant after successful payment
 const PLAN_PERIOD_DAYS = {
-  single_once:          365,   // one-time purchase — 1 year access
+  single_once:          365,
   comprehensive_once:   365,
-  single_weekly:         30,   // renewable monthly
+  single_weekly:         30,
   comprehensive_weekly:  30,
 };
 
@@ -106,17 +89,22 @@ const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,253}\.[^\s@]{2,}$/;
 
 
 // ── DATABASE ──────────────────────────────────────────────────
-// Vercel serverless: only /tmp is writable. Use it in production so the DB
-// file can be created. Note: /tmp is ephemeral between cold starts — for
-// persistent storage in production, replace with Turso/Neon/PlanetScale.
-const DB_PATH = NODE_ENV === "production"
-  ? path.join("/tmp", "glauc_users.db")
-  : path.join(__dirname, "glauc_users.db");
+// @libsql/client works on Vercel Lambda (WASM-based, no native addon).
+// Use LIBSQL_URL env var to point to a Turso cloud DB in production for
+// persistence across cold starts. Falls back to an ephemeral /tmp file.
+const DB_URL = process.env.LIBSQL_URL || (
+  NODE_ENV === "production"
+    ? "file:/tmp/glauc.db"
+    : `file:${path.join(__dirname, "glauc.db")}`
+);
 
-const db = new Database(DB_PATH);
-db.pragma("journal_mode = WAL");
+const db = createClient({
+  url:       DB_URL,
+  authToken: process.env.LIBSQL_AUTH_TOKEN,
+});
 
-db.exec(`
+// Schema init — top-level await is valid in ESM
+await db.executeMultiple(`
   CREATE TABLE IF NOT EXISTS users (
     id             TEXT PRIMARY KEY,
     email          TEXT UNIQUE NOT NULL,
@@ -158,48 +146,79 @@ db.exec(`
   );
 `);
 
-const stmts = {
-  findByEmail:      db.prepare("SELECT * FROM users WHERE email = ?"),
-  findById:         db.prepare("SELECT * FROM users WHERE id = ?"),
-  createUser:       db.prepare("INSERT INTO users (id, email, password_hash, name) VALUES (?, ?, ?, ?)"),
-  findOAuth:        db.prepare("SELECT u.* FROM oauth_accounts o JOIN users u ON u.id = o.user_id WHERE o.provider = ? AND o.provider_id = ?"),
-  linkOAuth:        db.prepare("INSERT OR IGNORE INTO oauth_accounts (id, user_id, provider, provider_id) VALUES (?, ?, ?, ?)"),
-  scansToday:       db.prepare("SELECT COUNT(*) AS n FROM scan_log WHERE user_id = ? AND date(created_at) = date('now','utc')"),
-  logScan:          db.prepare("INSERT INTO scan_log (id, user_id) VALUES (?, ?)"),
-  updateLastScan:   db.prepare("UPDATE users SET last_scan_at = datetime('now','utc') WHERE id = ?"),
 
-  // Subscription
-  getSub:    db.prepare("SELECT * FROM subscriptions WHERE user_id = ?"),
-  getSubByPI:db.prepare("SELECT * FROM subscriptions WHERE payment_intent = ?"),
-  upsertSub: db.prepare(`
-    INSERT INTO subscriptions (id, user_id, plan_id, status, payment_intent, stripe_customer, period_start, period_end)
-    VALUES (?, ?, ?, ?, ?, ?, datetime('now','utc'), ?)
-    ON CONFLICT(user_id) DO UPDATE SET
-      plan_id         = excluded.plan_id,
-      status          = excluded.status,
-      payment_intent  = excluded.payment_intent,
-      stripe_customer = excluded.stripe_customer,
-      period_start    = datetime('now','utc'),
-      period_end      = excluded.period_end,
-      updated_at      = datetime('now','utc')
-  `),
-  updateSubStatus: db.prepare(
-    "UPDATE subscriptions SET status = ?, updated_at = datetime('now','utc') WHERE user_id = ?"
-  ),
-  updateSubByPI: db.prepare(`
-    UPDATE subscriptions
-    SET status = ?, period_start = datetime('now','utc'), period_end = ?,
-        updated_at = datetime('now','utc')
-    WHERE payment_intent = ?
-  `),
+// ── DB HELPERS ────────────────────────────────────────────────
+const q = {
+  findByEmail: (email) =>
+    db.execute({ sql: "SELECT * FROM users WHERE email = ?", args: [email] })
+      .then(r => r.rows[0] ?? null),
+
+  findById: (id) =>
+    db.execute({ sql: "SELECT * FROM users WHERE id = ?", args: [id] })
+      .then(r => r.rows[0] ?? null),
+
+  createUser: (id, email, hash, name) =>
+    db.execute({ sql: "INSERT INTO users (id, email, password_hash, name) VALUES (?, ?, ?, ?)", args: [id, email, hash, name] }),
+
+  findOAuth: (provider, providerId) =>
+    db.execute({
+      sql: "SELECT u.* FROM oauth_accounts o JOIN users u ON u.id = o.user_id WHERE o.provider = ? AND o.provider_id = ?",
+      args: [provider, providerId],
+    }).then(r => r.rows[0] ?? null),
+
+  linkOAuth: (id, userId, provider, providerId) =>
+    db.execute({ sql: "INSERT OR IGNORE INTO oauth_accounts (id, user_id, provider, provider_id) VALUES (?, ?, ?, ?)", args: [id, userId, provider, providerId] }),
+
+  scansToday: (userId) =>
+    db.execute({
+      sql: "SELECT COUNT(*) AS n FROM scan_log WHERE user_id = ? AND date(created_at) = date('now','utc')",
+      args: [userId],
+    }).then(r => Number(r.rows[0]?.n ?? 0)),
+
+  logScan: (id, userId) =>
+    db.execute({ sql: "INSERT INTO scan_log (id, user_id) VALUES (?, ?)", args: [id, userId] }),
+
+  updateLastScan: (userId) =>
+    db.execute({ sql: "UPDATE users SET last_scan_at = datetime('now','utc') WHERE id = ?", args: [userId] }),
+
+  setReminder: (enabled, userId) =>
+    db.execute({ sql: "UPDATE users SET reminder_enabled = ? WHERE id = ?", args: [enabled ? 1 : 0, userId] }),
+
+  getSub: (userId) =>
+    db.execute({ sql: "SELECT * FROM subscriptions WHERE user_id = ?", args: [userId] })
+      .then(r => r.rows[0] ?? null),
+
+  getSubByPI: (piId) =>
+    db.execute({ sql: "SELECT * FROM subscriptions WHERE payment_intent = ?", args: [piId] })
+      .then(r => r.rows[0] ?? null),
+
+  upsertSub: (id, userId, planId, status, piId, customerId, periodEnd) =>
+    db.execute({
+      sql: `INSERT INTO subscriptions (id, user_id, plan_id, status, payment_intent, stripe_customer, period_start, period_end)
+            VALUES (?, ?, ?, ?, ?, ?, datetime('now','utc'), ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              plan_id         = excluded.plan_id,
+              status          = excluded.status,
+              payment_intent  = excluded.payment_intent,
+              stripe_customer = excluded.stripe_customer,
+              period_start    = datetime('now','utc'),
+              period_end      = excluded.period_end,
+              updated_at      = datetime('now','utc')`,
+      args: [id, userId, planId, status, piId, customerId, periodEnd],
+    }),
+
+  updateSubByPI: (status, periodEnd, piId) =>
+    db.execute({
+      sql: "UPDATE subscriptions SET status = ?, period_start = datetime('now','utc'), period_end = ?, updated_at = datetime('now','utc') WHERE payment_intent = ?",
+      args: [status, periodEnd, piId],
+    }),
 };
 
 
 // ── APP ───────────────────────────────────────────────────────
-const app    = express();
+const app = express();
 
 // ── STRIPE WEBHOOK (raw body — must be before express.json()) ─
-// Stripe requires the raw request body to verify the signature.
 app.post(
   "/webhook/stripe",
   express.raw({ type: "application/json" }),
@@ -223,20 +242,19 @@ app.post(
     try {
       switch (event.type) {
         case "payment_intent.succeeded": {
-          const pi = event.data.object;
-          const sub = stmts.getSubByPI.get(pi.id);
+          const pi  = event.data.object;
+          const sub = await q.getSubByPI(pi.id);
           if (sub) {
-            const planId = sub.plan_id;
-            const days   = PLAN_PERIOD_DAYS[planId] || 30;
+            const days      = PLAN_PERIOD_DAYS[sub.plan_id] || 30;
             const periodEnd = new Date(Date.now() + days * 86_400_000).toISOString();
-            stmts.updateSubByPI.run("active", periodEnd, pi.id);
+            await q.updateSubByPI("active", periodEnd, pi.id);
             log.info("stripe_payment_succeeded", { piId: pi.id });
           }
           break;
         }
         case "payment_intent.payment_failed": {
           const pi = event.data.object;
-          stmts.updateSubByPI.run("payment_failed", null, pi.id);
+          await q.updateSubByPI("payment_failed", null, pi.id);
           log.warn("stripe_payment_failed", { piId: pi.id });
           break;
         }
@@ -337,20 +355,23 @@ function gatewayHeaders() {
   return GATEWAY_SECRET ? { "X-Gateway-Secret": GATEWAY_SECRET } : {};
 }
 
-function checkScanRateLimit(req, res, next) {
-  const { n } = stmts.scansToday.get(req.userId);
-  if (n >= MAX_SCANS_DAY) {
-    log.warn("scan_rate_limit", { userId: anonymiseId(req.userId) });
-    return res.status(429).json({
-      error:   "Daily scan limit reached.",
-      message: `You can perform up to ${MAX_SCANS_DAY} scans per day.`,
-      resetAt: "midnight UTC",
-    });
+async function checkScanRateLimit(req, res, next) {
+  try {
+    const n = await q.scansToday(req.userId);
+    if (n >= MAX_SCANS_DAY) {
+      log.warn("scan_rate_limit", { userId: anonymiseId(req.userId) });
+      return res.status(429).json({
+        error:   "Daily scan limit reached.",
+        message: `You can perform up to ${MAX_SCANS_DAY} scans per day.`,
+        resetAt: "midnight UTC",
+      });
+    }
+    next();
+  } catch (err) {
+    next(err);
   }
-  next();
 }
 
-// Build a safe user response object
 function userResponse(user) {
   return {
     id:    anonymiseId(user.id),
@@ -362,7 +383,7 @@ function userResponse(user) {
 
 // ── ROUTES ────────────────────────────────────────────────────
 app.get("/health", (_req, res) => res.json({
-  status: "ok", gateway: "glauc-node-gateway", version: "1.2.0",
+  status: "ok", gateway: "glauc-node-gateway", version: "1.4.0",
   timestamp: new Date().toISOString(),
 }));
 
@@ -370,23 +391,21 @@ app.get("/health", (_req, res) => res.json({
 // ── POST /auth/register ───────────────────────────────────────
 app.post("/auth/register", authLimiter, async (req, res) => {
   const { email = "", password = "", name = "" } = req.body;
-  if (!email || !password) {
+  if (!email || !password)
     return res.status(400).json({ error: "Email and password are required." });
-  }
-  if (!EMAIL_RE.test(email)) {
+  if (!EMAIL_RE.test(email))
     return res.status(400).json({ error: "Invalid email address." });
-  }
-  if (password.length < 8) {
+  if (password.length < 8)
     return res.status(400).json({ error: "Password must be at least 8 characters." });
-  }
+
   const normEmail = email.toLowerCase().trim();
-  if (stmts.findByEmail.get(normEmail)) {
+  if (await q.findByEmail(normEmail))
     return res.status(409).json({ error: "An account with this email already exists." });
-  }
+
   const userId       = randomUUID();
   const passwordHash = await hashPassword(password);
   try {
-    stmts.createUser.run(userId, normEmail, passwordHash, name.trim() || "");
+    await q.createUser(userId, normEmail, passwordHash, name.trim() || "");
     const token = await signToken(userId);
     log.info("user_registered", { userId: anonymiseId(userId) });
     return res.status(201).json({ token, isNewUser: true, user: userResponse({ id: userId, email: normEmail, name: name.trim() }) });
@@ -400,12 +419,12 @@ app.post("/auth/register", authLimiter, async (req, res) => {
 // ── POST /auth/login ──────────────────────────────────────────
 app.post("/auth/login", authLimiter, async (req, res) => {
   const { email = "", password = "" } = req.body;
-  if (!email || !password) {
+  if (!email || !password)
     return res.status(400).json({ error: "Email and password are required." });
-  }
-  const user = stmts.findByEmail.get(email.toLowerCase().trim());
+
+  const user      = await q.findByEmail(email.toLowerCase().trim());
   const dummyHash = "$2b$12$invalidhashfortimingnormalization00000000000000000000000";
-  const valid = user
+  const valid     = user
     ? await verifyPassword(password, user.password_hash)
     : (await verifyPassword(password, dummyHash), false);
 
@@ -422,49 +441,42 @@ app.post("/auth/login", authLimiter, async (req, res) => {
 // ── POST /auth/google ─────────────────────────────────────────
 app.post("/auth/google", authLimiter, async (req, res) => {
   const { id_token } = req.body;
-  if (!id_token || typeof id_token !== "string") {
+  if (!id_token || typeof id_token !== "string")
     return res.status(400).json({ error: "id_token is required." });
-  }
+
   try {
-    // Verify via Google's tokeninfo endpoint (no extra library needed)
     const infoRes = await fetch(
       `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(id_token)}`,
       { signal: AbortSignal.timeout(8_000) }
     );
-    if (!infoRes.ok) {
+    if (!infoRes.ok)
       return res.status(401).json({ error: "Google token verification failed." });
-    }
+
     const info = await infoRes.json();
 
-    // Validate audience (must match one of our registered client IDs)
     if (GOOGLE_CLIENT_IDS.length > 0 && !GOOGLE_CLIENT_IDS.includes(info.aud)) {
       log.warn("google_audience_mismatch", { aud: info.aud });
       return res.status(401).json({ error: "Token audience mismatch." });
     }
-
-    if (!info.email || info.email_verified !== "true") {
+    if (!info.email || info.email_verified !== "true")
       return res.status(400).json({ error: "Google account email not verified." });
-    }
 
     const googleUserId = info.sub;
     const email        = info.email.toLowerCase();
     const displayName  = info.name || info.given_name || "";
 
-    // Look up by OAuth account first, then by email
-    let user = stmts.findOAuth.get("google", googleUserId);
+    let user      = await q.findOAuth("google", googleUserId);
     let isNewUser = false;
 
     if (!user) {
-      user = stmts.findByEmail.get(email);
+      user = await q.findByEmail(email);
       if (!user) {
-        // Create new account
         const userId = randomUUID();
-        stmts.createUser.run(userId, email, "OAUTH_GOOGLE", displayName);
-        user = stmts.findById.get(userId);
+        await q.createUser(userId, email, "OAUTH_GOOGLE", displayName);
+        user      = await q.findById(userId);
         isNewUser = true;
       }
-      // Link OAuth account
-      stmts.linkOAuth.run(randomUUID(), user.id, "google", googleUserId);
+      await q.linkOAuth(randomUUID(), user.id, "google", googleUserId);
     }
 
     const token = await signToken(user.id);
@@ -478,36 +490,32 @@ app.post("/auth/google", authLimiter, async (req, res) => {
 
 
 // ── POST /auth/apple ──────────────────────────────────────────
-// Cache Apple's JWKS for 1 hour to avoid repeated fetches
-let appleJWKSCache = null;
+let appleJWKSCache     = null;
 let appleJWKSFetchedAt = 0;
-const APPLE_JWKS_TTL = 60 * 60 * 1000; // 1 hour
+const APPLE_JWKS_TTL   = 60 * 60 * 1000;
 
 async function getAppleJWKS() {
   if (appleJWKSCache && Date.now() - appleJWKSFetchedAt < APPLE_JWKS_TTL) {
     return appleJWKSCache;
   }
-  const r = await fetch("https://appleid.apple.com/auth/keys", {
-    signal: AbortSignal.timeout(8_000),
-  });
+  const r = await fetch("https://appleid.apple.com/auth/keys", { signal: AbortSignal.timeout(8_000) });
   if (!r.ok) throw new Error("Failed to fetch Apple JWKS");
-  const { keys } = await r.json();
-  appleJWKSCache    = keys;
+  const { keys }     = await r.json();
+  appleJWKSCache     = keys;
   appleJWKSFetchedAt = Date.now();
   return keys;
 }
 
 app.post("/auth/apple", authLimiter, async (req, res) => {
   const { identity_token, name } = req.body;
-  if (!identity_token || typeof identity_token !== "string") {
+  if (!identity_token || typeof identity_token !== "string")
     return res.status(400).json({ error: "identity_token is required." });
-  }
+
   try {
-    // Decode header to find the right key
     const parts = identity_token.split(".");
-    if (parts.length !== 3) {
+    if (parts.length !== 3)
       return res.status(400).json({ error: "Malformed identity token." });
-    }
+
     let header;
     try {
       header = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8"));
@@ -515,40 +523,35 @@ app.post("/auth/apple", authLimiter, async (req, res) => {
       return res.status(400).json({ error: "Could not decode token header." });
     }
 
-    const keys = await getAppleJWKS();
-    const jwk  = keys.find(k => k.kid === header.kid);
-    if (!jwk) {
-      return res.status(401).json({ error: "No matching Apple key found." });
-    }
+    const keys     = await getAppleJWKS();
+    const jwk      = keys.find(k => k.kid === header.kid);
+    if (!jwk) return res.status(401).json({ error: "No matching Apple key found." });
 
-    const publicKey = await importJWK(jwk);
-    const { payload } = await jwtVerify(identity_token, publicKey, {
+    const publicKey        = await importJWK(jwk);
+    const { payload }      = await jwtVerify(identity_token, publicKey, {
       issuer:   "https://appleid.apple.com",
       audience: APPLE_BUNDLE_ID,
     });
 
     const appleUserId = payload.sub;
-    // Apple may provide private relay email or real email
-    const email = (payload.email || `${appleUserId}@privaterelay.appleid.com`).toLowerCase();
-
-    // Resolve name from request body (only available on first sign-in via Apple)
-    let displayName = "";
+    const email       = (payload.email || `${appleUserId}@privaterelay.appleid.com`).toLowerCase();
+    let displayName   = "";
     if (name && (name.firstName || name.lastName)) {
       displayName = `${name.firstName || ""} ${name.lastName || ""}`.trim();
     }
 
-    let user = stmts.findOAuth.get("apple", appleUserId);
+    let user      = await q.findOAuth("apple", appleUserId);
     let isNewUser = false;
 
     if (!user) {
-      user = stmts.findByEmail.get(email);
+      user = await q.findByEmail(email);
       if (!user) {
         const userId = randomUUID();
-        stmts.createUser.run(userId, email, "OAUTH_APPLE", displayName);
-        user = stmts.findById.get(userId);
+        await q.createUser(userId, email, "OAUTH_APPLE", displayName);
+        user      = await q.findById(userId);
         isNewUser = true;
       }
-      stmts.linkOAuth.run(randomUUID(), user.id, "apple", appleUserId);
+      await q.linkOAuth(randomUUID(), user.id, "apple", appleUserId);
     }
 
     const token = await signToken(user.id);
@@ -562,42 +565,42 @@ app.post("/auth/apple", authLimiter, async (req, res) => {
 
 
 // ── GET /auth/me ──────────────────────────────────────────────
-app.get("/auth/me", verifyToken, (req, res) => {
-  const user = stmts.findById.get(req.userId);
+app.get("/auth/me", verifyToken, async (req, res) => {
+  const user = await q.findById(req.userId);
   if (!user) return res.status(404).json({ error: "User not found." });
+  const scansToday = await q.scansToday(user.id);
   res.json({
-    id:              anonymiseId(user.id),
-    email:           user.email,
-    name:            user.name || "",
-    joinedAt:        user.created_at,
-    lastScan:        user.last_scan_at,
-    reminder_enabled: !!user.reminder_enabled,
-    scansToday:      stmts.scansToday.get(user.id).n,
+    id:               anonymiseId(user.id),
+    email:            user.email,
+    name:             user.name || "",
+    joinedAt:         user.created_at,
+    lastScan:         user.last_scan_at,
+    reminder_enabled: !!Number(user.reminder_enabled),
+    scansToday,
   });
 });
 
 
 // ── POST /scan ────────────────────────────────────────────────
 app.post("/scan", verifyToken, checkScanRateLimit, upload.single("file"), async (req, res) => {
-  if (!req.file) {
+  if (!req.file)
     return res.status(400).json({ error: "No image file uploaded." });
-  }
+
   const { gender = "", race = "", age, datetime_str = "" } = req.body;
-  if (!gender || !race || age == null) {
+  if (!gender || !race || age == null)
     return res.status(400).json({ error: "gender, race, and age are required." });
-  }
+
   const ageInt = parseInt(age);
-  if (isNaN(ageInt) || ageInt < 10 || ageInt > 110) {
+  if (isNaN(ageInt) || ageInt < 10 || ageInt > 110)
     return res.status(400).json({ error: "age must be a number between 10 and 110." });
-  }
+
   const normGender = gender.trim().toUpperCase();
-  if (!VALID_GENDERS.has(normGender)) {
+  if (!VALID_GENDERS.has(normGender))
     return res.status(400).json({ error: "Invalid gender value." });
-  }
+
   const normRace = race.trim().slice(0, 30);
-  if (!normRace) {
+  if (!normRace)
     return res.status(400).json({ error: "Invalid race value." });
-  }
 
   let processedBuffer;
   try {
@@ -631,17 +634,15 @@ app.post("/scan", verifyToken, checkScanRateLimit, upload.single("file"), async 
     return res.status(503).json({ error: "Model server unreachable.", message: "Please try again in a moment." });
   }
 
-  if (pythonRes.status === 422) {
-    return res.status(422).json(await pythonRes.json());
-  }
+  if (pythonRes.status === 422) return res.status(422).json(await pythonRes.json());
   if (!pythonRes.ok) {
     log.error("python_api_error", { status: pythonRes.status });
     return res.status(500).json({ error: "Model inference failed." });
   }
 
   const result = await pythonRes.json();
-  stmts.logScan.run(result.session_id || randomUUID(), req.userId);
-  stmts.updateLastScan.run(req.userId);
+  await q.logScan(result.session_id || randomUUID(), req.userId);
+  await q.updateLastScan(req.userId);
   log.info("scan_complete", { userId: anonId });
   return res.json(result);
 });
@@ -694,41 +695,31 @@ app.get("/trend", verifyToken, async (req, res) => {
 
 
 // ── POST /reminder ────────────────────────────────────────────
-app.post("/reminder", verifyToken, (req, res) => {
+app.post("/reminder", verifyToken, async (req, res) => {
   const { enabled } = req.body;
-  db.prepare("UPDATE users SET reminder_enabled = ? WHERE id = ?")
-    .run(enabled ? 1 : 0, req.userId);
+  await q.setReminder(enabled, req.userId);
   return res.json({ success: true, reminder_enabled: !!enabled });
 });
 
 
-// ══════════════════════════════════════════════════════════════
-// SUBSCRIPTION ENDPOINTS
-// ══════════════════════════════════════════════════════════════
-
 // ── POST /subscription/create-payment-intent ──────────────────
-// Creates a Stripe PaymentIntent for the selected plan.
-// Client uses the returned clientSecret to present PaymentSheet.
 app.post("/subscription/create-payment-intent", verifyToken, async (req, res) => {
-  if (!stripe) {
+  if (!stripe)
     return res.status(503).json({ error: "Payment processing is not configured." });
-  }
 
   const { plan_id } = req.body;
-  if (!plan_id || !PLAN_AMOUNTS[plan_id]) {
+  if (!plan_id || !PLAN_AMOUNTS[plan_id])
     return res.status(400).json({ error: "Invalid plan_id." });
-  }
 
-  const amount   = PLAN_AMOUNTS[plan_id];
-  const anonId   = anonymiseId(req.userId);
+  const amount = PLAN_AMOUNTS[plan_id];
+  const anonId = anonymiseId(req.userId);
 
   try {
-    // Create or retrieve a Stripe Customer for idempotent billing
-    const existingSub = stmts.getSub.get(req.userId);
-    let customerId = existingSub?.stripe_customer || null;
+    const existingSub = await q.getSub(req.userId);
+    let customerId    = existingSub?.stripe_customer || null;
 
     if (!customerId) {
-      const user     = stmts.findById.get(req.userId);
+      const user     = await q.findById(req.userId);
       const customer = await stripe.customers.create({
         email:    user?.email,
         metadata: { internal_id: anonId },
@@ -740,18 +731,14 @@ app.post("/subscription/create-payment-intent", verifyToken, async (req, res) =>
       amount,
       currency:              "usd",
       customer:              customerId,
-      setup_future_usage:    "off_session",   // save card for renewals
+      setup_future_usage:    "off_session",
       metadata:              { plan_id, internal_id: anonId },
       automatic_payment_methods: { enabled: true },
     });
 
-    // Reserve the subscription row so the webhook can find it
     const days      = PLAN_PERIOD_DAYS[plan_id] || 30;
     const periodEnd = new Date(Date.now() + days * 86_400_000).toISOString();
-    stmts.upsertSub.run(
-      randomUUID(), req.userId, plan_id, "pending",
-      paymentIntent.id, customerId, periodEnd
-    );
+    await q.upsertSub(randomUUID(), req.userId, plan_id, "pending", paymentIntent.id, customerId, periodEnd);
 
     log.info("payment_intent_created", { userId: anonId, plan_id });
     return res.json({
@@ -768,33 +755,22 @@ app.post("/subscription/create-payment-intent", verifyToken, async (req, res) =>
 
 
 // ── POST /subscription/activate ───────────────────────────────
-// Called after PaymentSheet completes successfully on the client.
-// Verifies the PaymentIntent status with Stripe before activating.
 app.post("/subscription/activate", verifyToken, async (req, res) => {
-  if (!stripe) {
+  if (!stripe)
     return res.status(503).json({ error: "Payment processing is not configured." });
-  }
 
   const { payment_intent_id, plan_id } = req.body;
-  if (!payment_intent_id || !plan_id) {
+  if (!payment_intent_id || !plan_id)
     return res.status(400).json({ error: "payment_intent_id and plan_id are required." });
-  }
-  if (!PLAN_AMOUNTS[plan_id]) {
+  if (!PLAN_AMOUNTS[plan_id])
     return res.status(400).json({ error: "Invalid plan_id." });
-  }
 
   try {
     const pi = await stripe.paymentIntents.retrieve(payment_intent_id);
-
     if (pi.status !== "succeeded") {
       log.warn("activate_payment_not_succeeded", { piId: payment_intent_id, status: pi.status });
-      return res.status(402).json({
-        error:  "Payment not completed.",
-        status: pi.status,
-      });
+      return res.status(402).json({ error: "Payment not completed.", status: pi.status });
     }
-
-    // Verify the plan matches what was originally created
     if (pi.metadata?.plan_id !== plan_id) {
       log.warn("activate_plan_mismatch", { expected: pi.metadata?.plan_id, got: plan_id });
       return res.status(400).json({ error: "Plan mismatch." });
@@ -802,17 +778,13 @@ app.post("/subscription/activate", verifyToken, async (req, res) => {
 
     const days      = PLAN_PERIOD_DAYS[plan_id] || 30;
     const periodEnd = new Date(Date.now() + days * 86_400_000).toISOString();
-
-    stmts.upsertSub.run(
-      randomUUID(), req.userId, plan_id, "active",
-      payment_intent_id, pi.customer || null, periodEnd
-    );
+    await q.upsertSub(randomUUID(), req.userId, plan_id, "active", payment_intent_id, pi.customer || null, periodEnd);
 
     log.info("subscription_activated", { userId: anonymiseId(req.userId), plan_id });
     return res.json({
-      success:         true,
-      status:          "active",
-      plan:            plan_id,
+      success:          true,
+      status:           "active",
+      plan:             plan_id,
       currentPeriodEnd: periodEnd,
     });
   } catch (err) {
@@ -823,13 +795,11 @@ app.post("/subscription/activate", verifyToken, async (req, res) => {
 
 
 // ── GET /subscription/status ──────────────────────────────────
-// Returns the user's current subscription or null if none.
-app.get("/subscription/status", verifyToken, (req, res) => {
+app.get("/subscription/status", verifyToken, async (req, res) => {
   try {
-    const sub = stmts.getSub.get(req.userId);
+    const sub = await q.getSub(req.userId);
     if (!sub) return res.json(null);
 
-    // Expire if period_end has passed
     const isExpired = sub.period_end && new Date(sub.period_end) < new Date();
     const status    = isExpired ? "expired" : sub.status;
 
@@ -849,28 +819,22 @@ app.get("/subscription/status", verifyToken, (req, res) => {
 
 // ── ERROR HANDLER ─────────────────────────────────────────────
 app.use((err, req, res, _next) => {
-  if (err.code === "LIMIT_FILE_SIZE") {
+  if (err.code === "LIMIT_FILE_SIZE")
     return res.status(413).json({ error: `File too large. Maximum is ${MAX_FILE_MB}MB.` });
-  }
-  if (err.message?.includes("Only JPEG")) {
+  if (err.message?.includes("Only JPEG"))
     return res.status(400).json({ error: err.message });
-  }
   log.error("unhandled_error", { message: err.message, path: req.path });
   res.status(500).json({ error: "Internal server error." });
 });
 
 
 // ── EXPORT (Vercel / serverless) ──────────────────────────────
-// @vercel/node requires the Express app to be the default export.
-// The listen() call below is skipped when running inside Vercel.
 export default app;
 
-// ── START (standalone / local / Railway / Render) ─────────────
+// ── START (standalone / local) ────────────────────────────────
 if (!process.env.VERCEL) {
   if (NODE_ENV === "production" && !process.env.HTTPS_PROXY && !process.env.FORCE_HTTP) {
-    log.warn("https_check", {
-      message: "Running in production — ensure a TLS-terminating reverse proxy is in front.",
-    });
+    log.warn("https_check", { message: "Running in production — ensure a TLS-terminating reverse proxy is in front." });
   }
   app.listen(PORT, () => {
     log.info("gateway_started", {

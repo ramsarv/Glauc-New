@@ -10,10 +10,10 @@
 import React, { useCallback } from 'react';
 import { View, StyleSheet, Text } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
-import { registerRootComponent } from 'expo';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import * as SplashScreen from 'expo-splash-screen';
 import { StatusBar } from 'expo-status-bar';
+import { registerRootComponent } from 'expo';
 
 import {
   useFonts,
@@ -40,10 +40,8 @@ try {
   _loadError = e.message + '\n\n' + (e.stack || '').slice(0, 1200);
   console.error('[Glauc] FATAL module load error:\n', _loadError);
   RootNavigator = () => (
-    <View style={{ flex: 1, backgroundColor: '#000', justifyContent: 'center', padding: 24 }}>
-      <Text style={{ color: '#ff5555', fontSize: 12, fontFamily: 'monospace', lineHeight: 18 }}>
-        {'MODULE LOAD ERROR\n\n' + _loadError}
-      </Text>
+    <View style={s.errorContainer}>
+      <Text style={s.errorText}>{'MODULE LOAD ERROR\n\n' + _loadError}</Text>
     </View>
   );
 }
@@ -54,17 +52,21 @@ SplashScreen.preventAutoHideAsync();
 // Optional Stripe — wraps the app only when the publishable key is configured
 const STRIPE_KEY = process.env.EXPO_PUBLIC_STRIPE_KEY || '';
 
-// Lazy-load StripeProvider so the app boots without Stripe if key is absent
 let StripeProvider = null;
 try {
-  // This will succeed in EAS builds where the Stripe SDK is installed
   StripeProvider = require('@stripe/stripe-react-native').StripeProvider;
 } catch {
-  // Expo Go / no Stripe SDK — subscription screen will show a friendly message
   StripeProvider = null;
 }
 
-export default function App() {
+// StyleSheet MUST be declared before App() so Hermes doesn't hit the TDZ
+const s = StyleSheet.create({
+  flex:           { flex: 1, backgroundColor: T.bgDeep },
+  errorContainer: { flex: 1, backgroundColor: '#000', justifyContent: 'center', padding: 24 },
+  errorText:      { color: '#ff5555', fontSize: 12, fontFamily: 'monospace', lineHeight: 18 },
+});
+
+function App() {
   const [fontsLoaded, fontError] = useFonts({
     PlayfairDisplay_700Bold,
     PlayfairDisplay_500Medium,
@@ -80,7 +82,6 @@ export default function App() {
     }
   }, [fontsLoaded, fontError]);
 
-  // Hold render until fonts are ready (avoids FOUT)
   if (!fontsLoaded && !fontError) return null;
 
   const tree = (
@@ -96,7 +97,6 @@ export default function App() {
     </GestureHandlerRootView>
   );
 
-  // Wrap with StripeProvider only when both key and SDK are available
   if (STRIPE_KEY && StripeProvider) {
     return (
       <StripeProvider
@@ -112,9 +112,7 @@ export default function App() {
   return tree;
 }
 
-const s = StyleSheet.create({
-  flex: { flex: 1, backgroundColor: T.bgDeep },
-});
-
-// Explicit registration — required in Expo 51 when "main" points to App.js directly.
+// Explicit registration works in both Expo Go and development builds.
+// Without this, "main has not been registered" occurs when Expo's Babel
+// transform doesn't auto-inject registerRootComponent for this entry setup.
 registerRootComponent(App);

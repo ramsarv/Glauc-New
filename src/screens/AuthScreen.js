@@ -86,20 +86,19 @@ export default function AuthScreen({ onSuccess }) {
   }, [showEmail]);
 
   // ── Google OAuth ───────────────────────────────────────────
-  // Pass null when client IDs aren't configured — useAuthRequest accepts null
-  // to disable the request rather than throwing on missing androidClientId.
+  // useAuthRequest must always receive an object (passing null causes it to
+  // crash reading .iosClientId). Use placeholder strings when not configured
+  // so the hook initialises safely — the button is disabled so it never fires.
   const googleConfigured = !!(
     process.env.EXPO_PUBLIC_GOOGLE_ANDROID_CLIENT_ID ||
     process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID
   );
-  const [, response, promptGoogleAsync] = Google.useAuthRequest(
-    googleConfigured ? {
-      clientId:        process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID,
-      iosClientId:     process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID,
-      androidClientId: process.env.EXPO_PUBLIC_GOOGLE_ANDROID_CLIENT_ID,
-      scopes: ['openid', 'profile', 'email'],
-    } : null
-  );
+  const [, response, promptGoogleAsync] = Google.useAuthRequest({
+    clientId:        process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID        || 'not-configured',
+    iosClientId:     process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID    || 'not-configured',
+    androidClientId: process.env.EXPO_PUBLIC_GOOGLE_ANDROID_CLIENT_ID || 'not-configured',
+    scopes: ['openid', 'profile', 'email'],
+  });
 
   useEffect(() => {
     if (response?.type === 'success') {

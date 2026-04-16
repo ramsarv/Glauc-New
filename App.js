@@ -8,8 +8,9 @@
  */
 
 import React, { useCallback } from 'react';
-import { View, StyleSheet } from 'react-native';
+import { View, StyleSheet, Text } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { registerRootComponent } from 'expo';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import * as SplashScreen from 'expo-splash-screen';
 import { StatusBar } from 'expo-status-bar';
@@ -114,3 +115,6 @@ export default function App() {
 const s = StyleSheet.create({
   flex: { flex: 1, backgroundColor: T.bgDeep },
 });
+
+// Explicit registration — required in Expo 51 when "main" points to App.js directly.
+registerRootComponent(App);

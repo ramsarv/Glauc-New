@@ -86,12 +86,20 @@ export default function AuthScreen({ onSuccess }) {
   }, [showEmail]);
 
   // ── Google OAuth ───────────────────────────────────────────
-  const [, response, promptGoogleAsync] = Google.useAuthRequest({
-    clientId:        process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID,
-    iosClientId:     process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID,
-    androidClientId: process.env.EXPO_PUBLIC_GOOGLE_ANDROID_CLIENT_ID,
-    scopes: ['openid', 'profile', 'email'],
-  });
+  // Pass null when client IDs aren't configured — useAuthRequest accepts null
+  // to disable the request rather than throwing on missing androidClientId.
+  const googleConfigured = !!(
+    process.env.EXPO_PUBLIC_GOOGLE_ANDROID_CLIENT_ID ||
+    process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID
+  );
+  const [, response, promptGoogleAsync] = Google.useAuthRequest(
+    googleConfigured ? {
+      clientId:        process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID,
+      iosClientId:     process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID,
+      androidClientId: process.env.EXPO_PUBLIC_GOOGLE_ANDROID_CLIENT_ID,
+      scopes: ['openid', 'profile', 'email'],
+    } : null
+  );
 
   useEffect(() => {
     if (response?.type === 'success') {
@@ -184,8 +192,9 @@ export default function AuthScreen({ onSuccess }) {
           {/* Primary OAuth */}
           <Animated.View style={[s.oauthGroup, { opacity: fadeAnim }]}>
             <TouchableOpacity
-              onPress={() => { setError(null); promptGoogleAsync(); }}
-              style={s.oauthBtn} disabled={loading} activeOpacity={0.82}
+              onPress={() => { setError(null); promptGoogleAsync?.(); }}
+              style={[s.oauthBtn, !googleConfigured && s.submitOff]}
+              disabled={loading || !googleConfigured} activeOpacity={0.82}
               accessibilityRole="button" accessibilityLabel="Continue with Google"
             >
               {loading ? <ActivityIndicator color={T.white} size="small" /> : (

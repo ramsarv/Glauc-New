@@ -1,0 +1,21 @@
+node_modules/
+.expo/
+dist/
+web-build/
+
+# Local env — contains secrets, never commit
+.env.local
+.env.production
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# EAS
+*.mobileprovision
+google-service-account.json
+GoogleService-Info.plist

@@ -42,6 +42,9 @@ const GATEWAY_SECRET = process.env.GATEWAY_SECRET || "";
 if (!GATEWAY_SECRET) {
   console.warn(JSON.stringify({ level: "warn", msg: "GATEWAY_SECRET not set — Python API has no gateway auth." }));
 }
+const ADMIN_EMAILS = new Set(
+  (process.env.ADMIN_EMAILS || "").split(",").map(s => s.trim().toLowerCase()).filter(Boolean)
+);
 
 const GOOGLE_CLIENT_IDS = [
   process.env.GOOGLE_CLIENT_ID,

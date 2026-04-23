@@ -800,6 +800,12 @@ app.post("/subscription/activate", verifyToken, async (req, res) => {
 // ── GET /subscription/status ──────────────────────────────────
 app.get("/subscription/status", verifyToken, async (req, res) => {
   try {
+    if (ADMIN_EMAILS.size > 0) {
+  const user = await q.findById(req.userId);
+  if (user && ADMIN_EMAILS.has(user.email.toLowerCase())) {
+    return res.json({ status: "active", plan: "admin" });
+  }
+}
     const sub = await q.getSub(req.userId);
     if (!sub) return res.json(null);
 

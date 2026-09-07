@@ -12,15 +12,13 @@ for root, dirs, files in os.walk(img_dir):
 # Read list.csv and check each entry
 found, missing = [], []
 with open(csv_path, newline="") as f:
-    reader = csv.reader(f)
-    for row in reader:
-        if not row:
-            continue
-        name = os.path.basename(row[0].strip())
-        (found if name in existing else missing).append(name)
+    for row in csv.reader(f):
+        if row:
+            name = os.path.basename(row[0].strip())
+            (found if name in existing else missing).append(name)
 
-print(f"Total in CSV : {len(found) + len(missing)}")
-print(f"Found in dir : {len(found)}")
-print(f"Missing      : {len(missing)}")
+print("Total in CSV:", len(found) + len(missing))
+print("Found in dir:", len(found))
+print("Missing:     ", len(missing))
 if missing[:10]:
-    print(f"First 10 missing: {missing[:10]}")
+    print("First 10 missing:", missing[:10])
